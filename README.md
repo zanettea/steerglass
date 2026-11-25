@@ -144,6 +144,15 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib   # Rust tests
 pnpm test                                               # frontend tests
 ```
 
+### Terminal UI (TUI)
+
+You can also run Steerglass directly in your terminal without a desktop window:
+
+```sh
+cargo run --manifest-path tui/Cargo.toml -- --help
+cargo run --manifest-path tui/Cargo.toml
+```
+
 Test against clusters you own (kind, k3d or minikube are perfect). `scripts/demo/up.sh` creates five
 local k3d clusters with realistic workloads, and `scripts/demo/run-app.sh` opens the app on them only,
 without touching your `~/.kube`. More in [CONTRIBUTING.md](CONTRIBUTING.md).

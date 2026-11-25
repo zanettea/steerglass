@@ -29,3 +29,4 @@ dist-ssr
 # Personal Claude Code settings
 .claude/settings.local.json
 scripts/demo/home/
+tui/target/
