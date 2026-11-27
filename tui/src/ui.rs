@@ -7,7 +7,10 @@ use ratatui::widgets::{
     TableState, Wrap,
 };
 
-use crate::app::{App, ConfirmKind, Focus, Modal, OverviewPane, Screen, YamlViewMode};
+use crate::app::{
+    App, ConfirmKind, Focus, Modal, OverviewPane, Screen, UtilizationPane, UtilizationSort,
+    YamlViewMode,
+};
 use crate::core::health::Severity;
 use crate::core::rows::{self, Health};
 use crate::env::{EnvChoice, detect_env};
@@ -114,6 +117,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
+        Screen::Utilization => {
+            spans.push(Span::styled(
+                "Utilization",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+            let sort_lbl = match app.utilization_sort {
+                UtilizationSort::CpuDesc => "sort: CPU",
+                UtilizationSort::MemDesc => "sort: Memory",
+            };
+            spans.push(Span::styled(format!("  ({sort_lbl})"), Style::default().fg(ACCENT)));
+            if app.filter_active || !app.filter_text.is_empty() {
+                spans.push(Span::styled("  │  /", Style::default().fg(DIM)));
+                spans.push(Span::styled(
+                    &app.filter_text,
+                    Style::default().fg(Color::Green),
+                ));
+                if app.filter_active {
+                    spans.push(Span::styled("▌", Style::default().fg(Color::Green)));
+                }
+            }
+        }
     }
 
     let block = Block::default()
@@ -193,6 +217,7 @@ fn render_main(f: &mut Frame, app: &App, area: Rect) {
     match app.screen {
         Screen::Overview => render_overview(f, app, area),
         Screen::Resources => render_resources(f, app, area),
+        Screen::Utilization => render_utilization(f, app, area),
     }
 }
 
@@ -510,8 +535,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = match app.screen {
-        Screen::Overview => "0 Overview  1-9 Cluster  J/K Move  e Env  Tab Sidebar  o Pane  Enter Open  Space Multi  s Scan  : Palette  ? Help  q Quit",
-        Screen::Resources => ":/Ctrl+K Palette  / Filter  A Age-sort  n Namespace  [/] Kind  Enter/y YAML  l Logs  s Shell  D Debug  E Edit  d Delete  ? Help  q Quit",
+        Screen::Overview => "0 Overview  1-9 Cluster  J/K Move  e Env  u Usage  Tab Sidebar  o Pane  Enter Open  Space Multi  s Scan  : Palette  ? Help  q Quit",
+        Screen::Resources => ":/Ctrl+K Palette  / Filter  u Usage  A Age-sort  n Namespace  [/] Kind  Enter/y YAML  x/i Decode  l Logs  s Shell  D Debug  F Forward  d Delete  ? Help  q Quit",
+        Screen::Utilization => "/ Filter  o Switch Pane  c Sort CPU  m Sort Memory  r Refresh  j/k Scroll  Enter Open Pod  0/Esc Overview  ? Help  q Quit",
     };
 
     let p = Paragraph::new(Line::from(Span::styled(keys, Style::default().fg(DIM))))
@@ -534,6 +560,7 @@ fn render_modal(f: &mut Frame, app: &App) {
                 Line::from("  e            Change cluster environment classification (Sidebar or Overview)"),
                 Line::from("  Tab / h / l  Switch focus between Sidebar and Main"),
                 Line::from("  b            Toggle Sidebar"),
+                Line::from("  u            Resource utilization view (Node & Pod CPU/Memory)"),
                 Line::from("  Space / m    Toggle cluster in Multi-Cluster view"),
                 Line::from("  : / Ctrl+K   Command Palette (kinds, clusters, actions)"),
                 Line::from("  [ / ]        Previous / Next built-in resource kind"),
@@ -543,10 +570,13 @@ fn render_modal(f: &mut Frame, app: &App) {
                 Line::from("  j / k / ↑ /↓ Navigate rows (g/G top/bottom, PgUp/PgDn)"),
                 Line::from("  Enter / y    View YAML"),
                 Line::from("  x / i        Decode Secret data / Interpret certs, JSON, JWT"),
+                Line::from("  c (in YAML)  Copy displayed YAML/decoded/interpreted content"),
+                Line::from("  z (in YAML/Logs) Toggle borderless fullscreen view for clean selection"),
                 Line::from("  E            Edit YAML in $EDITOR and apply"),
                 Line::from("  l            Pod Logs (f: follow, t: timestamps, c: container)"),
                 Line::from("  s            Pod Shell (kubectl exec -it) / Overview: full scan"),
                 Line::from("  D (Shift+D)  Debug container (kubectl debug on Pod or Node)"),
+                Line::from("  F (Shift+F)  Port-forward (Pod or Service)"),
                 Line::from("  r            Rollout Restart (Deployment/StatefulSet/DaemonSet)"),
                 Line::from("  S            Scale replicas (Deployment/StatefulSet/ReplicaSet)"),
                 Line::from("  c / p        Node Cordon/Uncordon  |  CronJob Suspend/Resume"),
@@ -639,46 +669,83 @@ fn render_modal(f: &mut Frame, app: &App) {
             name,
             lines,
             mode,
+            fullscreen,
             scroll,
             loading,
             error,
             ..
         } => {
-            let area = centered_rect(88, 86, f.area());
-            f.render_widget(Clear, area);
             let mode_tag = match mode {
                 YamlViewMode::Raw => "",
                 YamlViewMode::Decoded => " [DECODED]",
                 YamlViewMode::Interpreted => " [INTERPRETED]",
             };
             let title = format!(
-                " YAML: {context} / {} / {name}{mode_tag} (j/k scroll, x decode, i interpret, E $EDITOR, Esc close) ",
+                " YAML: {context} / {} / {name}{mode_tag} (j/k scroll, x decode, i interpret, c copy, z full, E $EDITOR, Esc close) ",
                 kind.kind
             );
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT));
 
-            if *loading {
-                f.render_widget(Paragraph::new("Loading YAML...").block(block), area);
-            } else if let Some(err) = error {
+            if *fullscreen {
+                let area = f.area();
+                f.render_widget(Clear, area);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(area);
                 f.render_widget(
-                    Paragraph::new(err.as_str())
-                        .style(Style::default().fg(Color::Red))
-                        .block(block)
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    Paragraph::new(Line::from(Span::styled(
+                        title,
+                        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))),
+                    chunks[0],
                 );
+                if *loading {
+                    f.render_widget(Paragraph::new("Loading YAML..."), chunks[1]);
+                } else if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .wrap(Wrap { trim: false }),
+                        chunks[1],
+                    );
+                } else {
+                    let inner_h = chunks[1].height as usize;
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(*scroll)
+                        .take(inner_h)
+                        .map(|l| color_yaml_line(l))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible), chunks[1]);
+                }
             } else {
-                let inner_h = area.height.saturating_sub(2) as usize;
-                let visible: Vec<Line> = lines
-                    .iter()
-                    .skip(*scroll)
-                    .take(inner_h)
-                    .map(|l| color_yaml_line(l))
-                    .collect();
-                f.render_widget(Paragraph::new(visible).block(block), area);
+                let area = centered_rect(88, 86, f.area());
+                f.render_widget(Clear, area);
+                let block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT));
+
+                if *loading {
+                    f.render_widget(Paragraph::new("Loading YAML...").block(block), area);
+                } else if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .block(block)
+                            .wrap(Wrap { trim: false }),
+                        area,
+                    );
+                } else {
+                    let inner_h = area.height.saturating_sub(2) as usize;
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(*scroll)
+                        .take(inner_h)
+                        .map(|l| color_yaml_line(l))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible).block(block), area);
+                }
             }
         }
         Modal::LogsViewer {
@@ -686,47 +753,86 @@ fn render_modal(f: &mut Frame, app: &App) {
             pod,
             container,
             lines,
+            fullscreen,
             scroll,
             follow,
             timestamps,
             error,
             ..
         } => {
-            let area = centered_rect(90, 86, f.area());
-            f.render_widget(Clear, area);
             let c_name = container.as_deref().unwrap_or("default");
             let title = format!(
-                " Logs: {context} / {pod} [{c_name}] (follow:{} ts:{} | f:follow t:ts c:container Esc:close) ",
+                " Logs: {context} / {pod} [{c_name}] (follow:{} ts:{} | f:follow t:ts c:container z:full Esc:close) ",
                 if *follow { "ON" } else { "OFF" },
                 if *timestamps { "ON" } else { "OFF" }
             );
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT));
-
-            if let Some(err) = error {
+            if *fullscreen {
+                let area = f.area();
+                f.render_widget(Clear, area);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(area);
                 f.render_widget(
-                    Paragraph::new(err.as_str())
-                        .style(Style::default().fg(Color::Red))
-                        .block(block)
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    Paragraph::new(Line::from(Span::styled(
+                        title,
+                        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))),
+                    chunks[0],
                 );
-            } else {
-                let inner_h = area.height.saturating_sub(2) as usize;
-                let start = if *follow {
-                    lines.len().saturating_sub(inner_h)
+                if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .wrap(Wrap { trim: false }),
+                        chunks[1],
+                    );
                 } else {
-                    (*scroll).min(lines.len().saturating_sub(1))
-                };
-                let visible: Vec<Line> = lines
-                    .iter()
-                    .skip(start)
-                    .take(inner_h)
-                    .map(|l| Line::from(l.as_str()))
-                    .collect();
-                f.render_widget(Paragraph::new(visible).block(block), area);
+                    let inner_h = chunks[1].height as usize;
+                    let start = if *follow {
+                        lines.len().saturating_sub(inner_h)
+                    } else {
+                        (*scroll).min(lines.len().saturating_sub(1))
+                    };
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(start)
+                        .take(inner_h)
+                        .map(|l| Line::from(l.as_str()))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible), chunks[1]);
+                }
+            } else {
+                let area = centered_rect(90, 86, f.area());
+                f.render_widget(Clear, area);
+                let block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT));
+
+                if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .block(block)
+                            .wrap(Wrap { trim: false }),
+                        area,
+                    );
+                } else {
+                    let inner_h = area.height.saturating_sub(2) as usize;
+                    let start = if *follow {
+                        lines.len().saturating_sub(inner_h)
+                    } else {
+                        (*scroll).min(lines.len().saturating_sub(1))
+                    };
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(start)
+                        .take(inner_h)
+                        .map(|l| Line::from(l.as_str()))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible).block(block), area);
+                }
             }
         }
         Modal::Confirm { kind, typed } => {
@@ -986,6 +1092,142 @@ fn render_modal(f: &mut Frame, app: &App) {
                 chunks[hint_idx],
             );
         }
+        Modal::PortForwardPrompt {
+            kind,
+            namespace,
+            name,
+            input,
+            ports,
+            ports_loading,
+            selected_port,
+            active,
+            selected_active,
+            focus_active,
+            ..
+        } => {
+            let area = centered_rect(64, 54, f.area());
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .title(format!(" Port-Forward {kind}: {namespace}/{} ", truncate(name, 28)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Percentage(50),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "Port (port | local:remote | addr:local:remote): ",
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(
+                        format!("{input}▌"),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                chunks[0],
+            );
+
+            let ports_block = Block::default()
+                .title(" Available Ports ")
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(if !*focus_active { ACCENT } else { DIM }));
+            if *ports_loading {
+                f.render_widget(
+                    Paragraph::new("Loading ports...")
+                        .style(Style::default().fg(DIM))
+                        .block(ports_block),
+                    chunks[1],
+                );
+            } else if ports.is_empty() {
+                f.render_widget(
+                    Paragraph::new("No declared ports (type a port number above).")
+                        .style(Style::default().fg(DIM))
+                        .block(ports_block),
+                    chunks[1],
+                );
+            } else {
+                let items: Vec<ListItem> = ports
+                    .iter()
+                    .map(|p| {
+                        let name_part = p.name.as_deref().unwrap_or("-");
+                        let detail_part = p.detail.as_deref().unwrap_or("");
+                        let suffix = if detail_part.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ({detail_part})")
+                        };
+                        ListItem::new(format!(
+                            "{}/{}  {}{suffix}",
+                            p.port, p.protocol, name_part
+                        ))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some((*selected_port).min(items.len().saturating_sub(1))));
+                let list = List::new(items)
+                    .block(ports_block)
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(30, 41, 59))
+                            .fg(if !*focus_active { ACCENT } else { Color::Gray })
+                            .add_modifier(Modifier::BOLD),
+                    );
+                f.render_stateful_widget(list, chunks[1], &mut state);
+            }
+
+            let active_block = Block::default()
+                .title(" Active Forwards ")
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(if *focus_active { ACCENT } else { DIM }));
+            if active.is_empty() {
+                f.render_widget(
+                    Paragraph::new("No active port-forwards.")
+                        .style(Style::default().fg(DIM))
+                        .block(active_block),
+                    chunks[2],
+                );
+            } else {
+                let items: Vec<ListItem> = active
+                    .iter()
+                    .map(|fw| {
+                        ListItem::new(format!(
+                            "localhost:{} -> {}/{}:{} ({})",
+                            fw.local_port, fw.namespace, fw.target, fw.remote_port, fw.context
+                        ))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some((*selected_active).min(items.len().saturating_sub(1))));
+                let list = List::new(items)
+                    .block(active_block)
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(30, 41, 59))
+                            .fg(if *focus_active { ACCENT } else { Color::Gray })
+                            .add_modifier(Modifier::BOLD),
+                    );
+                f.render_stateful_widget(list, chunks[2], &mut state);
+            }
+
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "↑/↓ Select  Enter Start  Tab Switch list  Del Stop active  Esc Cancel",
+                    Style::default().fg(DIM),
+                ))),
+                chunks[3],
+            );
+        }
     }
 }
 
@@ -1002,6 +1244,291 @@ fn color_yaml_line(line: &str) -> Line<'_> {
         ]);
     }
     Line::from(line)
+}
+
+fn render_utilization(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    let multi = app.selected_contexts.len() > 1;
+    let loading = app
+        .selected_contexts
+        .iter()
+        .any(|c| app.utilization_loading.get(c).copied().unwrap_or(false));
+    let no_metrics = !loading
+        && app
+            .selected_contexts
+            .iter()
+            .any(|c| matches!(app.utilization_by_ctx.get(c), Some(Ok(u)) if !u.metrics_available));
+    let status_note = if loading {
+        " [loading...]"
+    } else if no_metrics {
+        " [metrics-server unavailable: showing requests/allocatable]"
+    } else {
+        ""
+    };
+
+    // Top pane: Nodes utilization
+    let nodes_focused = app.focus == Focus::Main && app.utilization_pane == UtilizationPane::Nodes;
+    let nodes = app.utilization_nodes();
+    let nodes_block = Block::default()
+        .title(format!(
+            " Nodes Utilization ({}){status_note} ",
+            nodes.len()
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if nodes_focused { ACCENT } else { DIM }));
+
+    if nodes.is_empty() {
+        let msg = if loading {
+            "Fetching node utilization..."
+        } else {
+            "No node utilization data. Press 'r' to refresh."
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(DIM)).block(nodes_block),
+            chunks[0],
+        );
+    } else {
+        let mut hdr = Vec::new();
+        if multi {
+            hdr.push(Cell::from("Context"));
+        }
+        hdr.extend([
+            Cell::from("Node"),
+            Cell::from("CPU"),
+            Cell::from("CPU Req"),
+            Cell::from("Memory"),
+            Cell::from("Mem Req"),
+            Cell::from("Pods"),
+        ]);
+        let header = TuiRow::new(hdr).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+        let rows: Vec<TuiRow> = nodes
+            .iter()
+            .map(|(ctx, n)| {
+                let cpu_cell = match n.cpu_used {
+                    Some(u) => {
+                        let (bar, col) = usage_bar(u, n.cpu_alloc, 8);
+                        Cell::from(format!("{bar} {}/{}", format_cpu(u), format_cpu(n.cpu_alloc)))
+                            .style(Style::default().fg(col))
+                    }
+                    None => Cell::from(format!("- / {}", format_cpu(n.cpu_alloc)))
+                        .style(Style::default().fg(DIM)),
+                };
+                let mem_cell = match n.mem_used {
+                    Some(u) => {
+                        let (bar, col) = usage_bar(u, n.mem_alloc, 8);
+                        Cell::from(format!("{bar} {}/{}", format_bytes(u), format_bytes(n.mem_alloc)))
+                            .style(Style::default().fg(col))
+                    }
+                    None => Cell::from(format!("- / {}", format_bytes(n.mem_alloc)))
+                        .style(Style::default().fg(DIM)),
+                };
+                let mut cells = Vec::new();
+                if multi {
+                    cells.push(Cell::from(ctx.as_str()));
+                }
+                cells.extend([
+                    Cell::from(n.name.as_str()),
+                    cpu_cell,
+                    Cell::from(format_cpu(n.cpu_req)),
+                    mem_cell,
+                    Cell::from(format_bytes(n.mem_req)),
+                    Cell::from(n.pods.to_string()),
+                ]);
+                TuiRow::new(cells)
+            })
+            .collect();
+
+        let mut widths = Vec::new();
+        if multi {
+            widths.push(Constraint::Length(18));
+        }
+        widths.extend([
+            Constraint::Min(18),
+            Constraint::Length(24),
+            Constraint::Length(9),
+            Constraint::Length(26),
+            Constraint::Length(10),
+            Constraint::Length(5),
+        ]);
+
+        let mut state = TableState::default();
+        state.select(Some(app.utilization_node_cursor.min(nodes.len().saturating_sub(1))));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(nodes_block)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 41, 59))
+                    .add_modifier(Modifier::BOLD),
+            );
+        f.render_stateful_widget(table, chunks[0], &mut state);
+    }
+
+    // Bottom pane: Pods utilization
+    let pods_focused = app.focus == Focus::Main && app.utilization_pane == UtilizationPane::Pods;
+    let pods = app.utilization_pods();
+    let pods_block = Block::default()
+        .title(format!(" Pods Utilization ({}) ", pods.len()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if pods_focused { ACCENT } else { DIM }));
+
+    if pods.is_empty() {
+        let msg = if loading {
+            "Fetching pod utilization..."
+        } else {
+            "No pod utilization data. Press 'r' to refresh."
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(DIM)).block(pods_block),
+            chunks[1],
+        );
+    } else {
+        let mut hdr = Vec::new();
+        if multi {
+            hdr.push(Cell::from("Context"));
+        }
+        hdr.extend([
+            Cell::from("Namespace"),
+            Cell::from("Pod"),
+            Cell::from("CPU Used"),
+            Cell::from("CPU Req/Lim"),
+            Cell::from("Mem Used"),
+            Cell::from("Mem Req/Lim"),
+        ]);
+        let header = TuiRow::new(hdr).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+        let rows: Vec<TuiRow> = pods
+            .iter()
+            .map(|(ctx, p)| {
+                let cpu_used_cell = match p.cpu_used {
+                    Some(u) => {
+                        let ref_cap = p.cpu_lim.unwrap_or(p.cpu_req);
+                        let col = if ref_cap > 0.0 && u / ref_cap >= 0.9 {
+                            Color::Red
+                        } else if ref_cap > 0.0 && u / ref_cap >= 0.7 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        };
+                        Cell::from(format_cpu(u)).style(Style::default().fg(col))
+                    }
+                    None => Cell::from("-").style(Style::default().fg(DIM)),
+                };
+                let mem_used_cell = match p.mem_used {
+                    Some(u) => {
+                        let ref_cap = p.mem_lim.unwrap_or(p.mem_req);
+                        let col = if ref_cap > 0.0 && u / ref_cap >= 0.9 {
+                            Color::Red
+                        } else if ref_cap > 0.0 && u / ref_cap >= 0.7 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        };
+                        Cell::from(format_bytes(u)).style(Style::default().fg(col))
+                    }
+                    None => Cell::from("-").style(Style::default().fg(DIM)),
+                };
+                let cpu_rl = format!(
+                    "{}/{}",
+                    format_cpu(p.cpu_req),
+                    p.cpu_lim.map(format_cpu).unwrap_or_else(|| "-".into())
+                );
+                let mem_rl = format!(
+                    "{}/{}",
+                    format_bytes(p.mem_req),
+                    p.mem_lim.map(format_bytes).unwrap_or_else(|| "-".into())
+                );
+                let mut cells = Vec::new();
+                if multi {
+                    cells.push(Cell::from(ctx.as_str()));
+                }
+                cells.extend([
+                    Cell::from(p.namespace.as_str()),
+                    Cell::from(p.name.as_str()),
+                    cpu_used_cell,
+                    Cell::from(cpu_rl),
+                    mem_used_cell,
+                    Cell::from(mem_rl),
+                ]);
+                TuiRow::new(cells)
+            })
+            .collect();
+
+        let mut widths = Vec::new();
+        if multi {
+            widths.push(Constraint::Length(18));
+        }
+        widths.extend([
+            Constraint::Length(16),
+            Constraint::Min(22),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(16),
+        ]);
+
+        let mut state = TableState::default();
+        state.select(Some(app.utilization_pod_cursor.min(pods.len().saturating_sub(1))));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(pods_block)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 41, 59))
+                    .add_modifier(Modifier::BOLD),
+            );
+        f.render_stateful_widget(table, chunks[1], &mut state);
+    }
+}
+
+fn format_cpu(cores: f64) -> String {
+    if cores <= 0.0 {
+        "0m".into()
+    } else if cores < 1.0 {
+        format!("{}m", (cores * 1000.0).round() as u64)
+    } else {
+        format!("{cores:.2}")
+    }
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const GI: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MI: f64 = 1024.0 * 1024.0;
+    const KI: f64 = 1024.0;
+    if bytes <= 0.0 {
+        "0".into()
+    } else if bytes >= GI {
+        format!("{:.1}Gi", bytes / GI)
+    } else if bytes >= MI {
+        format!("{:.0}Mi", bytes / MI)
+    } else if bytes >= KI {
+        format!("{:.0}Ki", bytes / KI)
+    } else {
+        format!("{:.0}B", bytes)
+    }
+}
+
+fn usage_bar(used: f64, total: f64, width: usize) -> (String, Color) {
+    if total <= 0.0 {
+        return (format!("[{}]", "░".repeat(width)), DIM);
+    }
+    let ratio = (used / total).clamp(0.0, 1.0);
+    let pct = ((used / total) * 100.0).round() as u64;
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    let bar = format!("[{}{}] {:>2}%", "█".repeat(filled), "░".repeat(width - filled), pct);
+    let color = if ratio >= 0.9 {
+        Color::Red
+    } else if ratio >= 0.7 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    (bar, color)
 }
 
 fn format_age(iso: &str) -> String {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{AsyncBufReadExt, StreamExt};
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams};
 use kube::runtime::{WatchStreamExt, watcher};
@@ -13,8 +13,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::core::commands::{dyn_api, kinds_for};
 use crate::core::error::{Error, Result};
 use crate::core::health::{self, Issue, Scan};
+use crate::core::metrics::{parse_bytes, parse_cpu};
 use crate::core::rows::{self, Row};
-use crate::core::state::{AppState, KindRef};
+use crate::core::state::{AppState, ForwardInfo, KindRef, StreamHandle};
 use crate::core::table::{self, Ev};
 
 const FIELD_MANAGER: &str = "steerglass";
@@ -27,6 +28,46 @@ pub struct ClusterSummary {
     pub nodes_ready: usize,
     pub pods: Option<i64>,
     pub latency_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeUsageEntry {
+    pub name: String,
+    pub cpu_used: Option<f64>,
+    pub cpu_req: f64,
+    pub cpu_alloc: f64,
+    pub mem_used: Option<f64>,
+    pub mem_req: f64,
+    pub mem_alloc: f64,
+    pub pods: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PodUsageEntry {
+    pub namespace: String,
+    pub name: String,
+    pub node: Option<String>,
+    pub cpu_used: Option<f64>,
+    pub cpu_req: f64,
+    pub cpu_lim: Option<f64>,
+    pub mem_used: Option<f64>,
+    pub mem_req: f64,
+    pub mem_lim: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterUtilization {
+    pub metrics_available: bool,
+    pub nodes: Vec<NodeUsageEntry>,
+    pub pods: Vec<PodUsageEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AvailablePort {
+    pub port: u16,
+    pub name: Option<String>,
+    pub protocol: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -57,6 +98,18 @@ pub enum AppEvent {
     SummaryLoaded {
         context: String,
         result: std::result::Result<ClusterSummary, String>,
+    },
+    UtilizationLoaded {
+        context: String,
+        result: std::result::Result<ClusterUtilization, String>,
+    },
+    PortForwardStarted(std::result::Result<ForwardInfo, String>),
+    PortsLoaded {
+        context: String,
+        namespace: String,
+        kind: String,
+        name: String,
+        result: std::result::Result<Vec<AvailablePort>, String>,
     },
     IssuesLoaded {
         context: String,
@@ -782,6 +835,410 @@ pub fn spawn_replace_yaml(
         let _ = tx.send(AppEvent::ActionDone {
             message: res,
             refresh_yaml: true,
+        });
+    });
+}
+
+pub fn spawn_utilization(
+    state: Arc<AppState>,
+    context: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let res = fetch_utilization(state, &context)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(AppEvent::UtilizationLoaded {
+            context,
+            result: res,
+        });
+    });
+}
+
+async fn fetch_utilization(state: Arc<AppState>, context: &str) -> Result<ClusterUtilization> {
+    let client = state.client(context).await?;
+    let get_req = |path: &str| -> Result<http::Request<Vec<u8>>> {
+        http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Vec::new())
+            .map_err(|e| Error::msg(e.to_string()))
+    };
+
+    let (node_metrics_res, pod_metrics_res, nodes_res, pods_res) = tokio::join!(
+        client.request::<Value>(get_req("/apis/metrics.k8s.io/v1beta1/nodes")?),
+        client.request::<Value>(get_req("/apis/metrics.k8s.io/v1beta1/pods")?),
+        client.request::<Value>(get_req("/api/v1/nodes")?),
+        client.request::<Value>(get_req("/api/v1/pods")?),
+    );
+
+    let metrics_available = node_metrics_res.is_ok() || pod_metrics_res.is_ok();
+    let mut node_used: HashMap<String, (f64, f64)> = HashMap::new();
+    if let Ok(nm) = node_metrics_res {
+        for item in nm["items"].as_array().into_iter().flatten() {
+            let name = item["metadata"]["name"].as_str().unwrap_or_default().to_string();
+            let cpu = item["usage"]["cpu"].as_str().and_then(parse_cpu).unwrap_or(0.0);
+            let mem = item["usage"]["memory"].as_str().and_then(parse_bytes).unwrap_or(0.0);
+            node_used.insert(name, (cpu, mem));
+        }
+    }
+
+    let mut pod_used: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    if let Ok(pm) = pod_metrics_res {
+        for item in pm["items"].as_array().into_iter().flatten() {
+            let ns = item["metadata"]["namespace"].as_str().unwrap_or_default().to_string();
+            let name = item["metadata"]["name"].as_str().unwrap_or_default().to_string();
+            let mut cpu = 0.0;
+            let mut mem = 0.0;
+            for c in item["containers"].as_array().into_iter().flatten() {
+                cpu += c["usage"]["cpu"].as_str().and_then(parse_cpu).unwrap_or(0.0);
+                mem += c["usage"]["memory"].as_str().and_then(parse_bytes).unwrap_or(0.0);
+            }
+            pod_used.insert((ns, name), (cpu, mem));
+        }
+    }
+
+    let pods_val = pods_res?;
+    let mut node_reqs: HashMap<String, (f64, f64, usize)> = HashMap::new();
+    let mut pods = Vec::new();
+    for p in pods_val["items"].as_array().into_iter().flatten() {
+        let ns = p["metadata"]["namespace"].as_str().unwrap_or_default().to_string();
+        let name = p["metadata"]["name"].as_str().unwrap_or_default().to_string();
+        let phase = p["status"]["phase"].as_str().unwrap_or_default();
+        let active = matches!(phase, "Running" | "Pending");
+        let node = p["spec"]["nodeName"].as_str().map(ToString::to_string);
+
+        let mut req_cpu = 0.0;
+        let mut req_mem = 0.0;
+        let mut lim_cpu: Option<f64> = Some(0.0);
+        let mut lim_mem: Option<f64> = Some(0.0);
+        for c in p["spec"]["containers"].as_array().into_iter().flatten() {
+            req_cpu += c["resources"]["requests"]["cpu"]
+                .as_str()
+                .and_then(parse_cpu)
+                .unwrap_or(0.0);
+            req_mem += c["resources"]["requests"]["memory"]
+                .as_str()
+                .and_then(parse_bytes)
+                .unwrap_or(0.0);
+            match c["resources"]["limits"]["cpu"].as_str().and_then(parse_cpu) {
+                Some(v) => {
+                    if let Some(acc) = lim_cpu.as_mut() {
+                        *acc += v;
+                    }
+                }
+                None => lim_cpu = None,
+            }
+            match c["resources"]["limits"]["memory"].as_str().and_then(parse_bytes) {
+                Some(v) => {
+                    if let Some(acc) = lim_mem.as_mut() {
+                        *acc += v;
+                    }
+                }
+                None => lim_mem = None,
+            }
+        }
+
+        if active {
+            if let Some(n) = &node {
+                let entry = node_reqs.entry(n.clone()).or_default();
+                entry.0 += req_cpu;
+                entry.1 += req_mem;
+                entry.2 += 1;
+            }
+        }
+
+        let used = pod_used.get(&(ns.clone(), name.clone()));
+        pods.push(PodUsageEntry {
+            namespace: ns,
+            name,
+            node,
+            cpu_used: used.map(|u| u.0),
+            cpu_req: req_cpu,
+            cpu_lim: lim_cpu,
+            mem_used: used.map(|u| u.1),
+            mem_req: req_mem,
+            mem_lim: lim_mem,
+        });
+    }
+
+    let nodes_val = nodes_res?;
+    let mut nodes = Vec::new();
+    for n in nodes_val["items"].as_array().into_iter().flatten() {
+        let name = n["metadata"]["name"].as_str().unwrap_or_default().to_string();
+        let cpu_alloc = n["status"]["allocatable"]["cpu"]
+            .as_str()
+            .and_then(parse_cpu)
+            .unwrap_or(0.0);
+        let mem_alloc = n["status"]["allocatable"]["memory"]
+            .as_str()
+            .and_then(parse_bytes)
+            .unwrap_or(0.0);
+        let (cpu_req, mem_req, pod_count) = node_reqs.get(&name).copied().unwrap_or_default();
+        let used = node_used.get(&name);
+        nodes.push(NodeUsageEntry {
+            name,
+            cpu_used: used.map(|u| u.0),
+            cpu_req,
+            cpu_alloc,
+            mem_used: used.map(|u| u.1),
+            mem_req,
+            mem_alloc,
+            pods: pod_count,
+        });
+    }
+
+    Ok(ClusterUtilization {
+        metrics_available,
+        nodes,
+        pods,
+    })
+}
+
+async fn resolve_service_port(api_pods: &Api<Pod>, svc: &Service, port: u16) -> Result<(String, u16)> {
+    let spec = svc.spec.as_ref().ok_or_else(|| Error::msg("service has no spec"))?;
+    let selector = spec
+        .selector
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::msg("service has no selector"))?;
+    let sel = selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pods = api_pods.list(&ListParams::default().labels(&sel)).await?;
+    let pod = pods
+        .items
+        .iter()
+        .find(|p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        })
+        .or(pods.items.first())
+        .ok_or_else(|| Error::msg("no pods behind this service"))?;
+    let svc_port = spec
+        .ports
+        .as_ref()
+        .and_then(|ps| ps.iter().find(|p| p.port == port as i32))
+        .ok_or_else(|| Error::msg(format!("service has no port {port}")))?;
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    let target = match &svc_port.target_port {
+        None => port,
+        Some(IntOrString::Int(n)) => *n as u16,
+        Some(IntOrString::String(named)) => pod
+            .spec
+            .as_ref()
+            .and_then(|s| {
+                s.containers
+                    .iter()
+                    .flat_map(|c| c.ports.iter().flatten())
+                    .find(|p| p.name.as_deref() == Some(named.as_str()))
+            })
+            .map(|p| p.container_port as u16)
+            .ok_or_else(|| Error::msg(format!("named port {named} not found")))?,
+    };
+    Ok((pod.metadata.name.clone().unwrap_or_default(), target))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_port_forward(
+    state: Arc<AppState>,
+    context: String,
+    namespace: String,
+    kind: String,
+    name: String,
+    port: u16,
+    local_port: Option<u16>,
+    bind_addr: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let res = start_port_forward(
+            state,
+            context,
+            namespace,
+            kind,
+            name,
+            port,
+            local_port,
+            bind_addr,
+        )
+        .await
+        .map_err(|e| e.to_string());
+        let _ = tx.send(AppEvent::PortForwardStarted(res));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_port_forward(
+    state: Arc<AppState>,
+    context: String,
+    namespace: String,
+    kind: String,
+    name: String,
+    port: u16,
+    local_port: Option<u16>,
+    bind_addr: String,
+) -> Result<ForwardInfo> {
+    let target = format!("{}/{}", kind.to_lowercase(), name);
+    let running = state
+        .streams
+        .lock()
+        .values()
+        .filter_map(|h| h.forward.clone())
+        .find(|f| {
+            f.context == context
+                && f.namespace == namespace
+                && f.target == target
+                && f.remote_port == port
+                && local_port.is_none_or(|l| l == f.local_port)
+        });
+    if let Some(f) = running {
+        return Ok(f);
+    }
+
+    let client = state.client(&context).await?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let (pod, remote_port) = if kind == "Service" {
+        let svc = Api::<Service>::namespaced(client.clone(), &namespace)
+            .get(&name)
+            .await?;
+        resolve_service_port(&pods, &svc, port).await?
+    } else {
+        (name, port)
+    };
+
+    let addr: std::net::IpAddr = bind_addr
+        .parse()
+        .map_err(|_| Error::msg(format!("invalid bind address: {bind_addr}")))?;
+    let listener = tokio::net::TcpListener::bind((addr, local_port.unwrap_or(0))).await?;
+    let bound = listener.local_addr()?.port();
+    let id = state.next_id();
+    let info = ForwardInfo {
+        id,
+        context,
+        namespace,
+        target,
+        remote_port: port,
+        local_port: bound,
+    };
+
+    let state_drop = state.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let pods = pods.clone();
+            let pod = pod.clone();
+            tokio::spawn(async move {
+                let Ok(mut pf) = pods.portforward(&pod, &[remote_port]).await else {
+                    return;
+                };
+                let Some(mut upstream) = pf.take_stream(remote_port) else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut conn, &mut upstream).await;
+                drop(upstream);
+                let _ = pf.join().await;
+            });
+        }
+        state_drop.streams.lock().remove(&id);
+    });
+
+    state.streams.lock().insert(
+        id,
+        StreamHandle {
+            abort: task.abort_handle(),
+            stdin: None,
+            resize: None,
+            forward: Some(info.clone()),
+        },
+    );
+    Ok(info)
+}
+
+pub fn list_port_forwards(state: &AppState) -> Vec<ForwardInfo> {
+    let mut v: Vec<ForwardInfo> = state
+        .streams
+        .lock()
+        .values()
+        .filter_map(|h| h.forward.clone())
+        .collect();
+    v.sort_by_key(|f| f.id);
+    v
+}
+
+pub fn stop_port_forward(state: &AppState, id: u64) -> Option<ForwardInfo> {
+    if let Some(handle) = state.streams.lock().remove(&id) {
+        handle.abort.abort();
+        return handle.forward;
+    }
+    None
+}
+
+pub fn spawn_available_ports(
+    state: Arc<AppState>,
+    context: String,
+    namespace: String,
+    kind: String,
+    name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let res = async {
+            let client = state.client(&context).await?;
+            let mut out = Vec::new();
+            if kind == "Service" {
+                let svc = Api::<Service>::namespaced(client, &namespace).get(&name).await?;
+                if let Some(ports) = svc.spec.and_then(|s| s.ports) {
+                    for p in ports {
+                        if let Ok(port) = u16::try_from(p.port) {
+                            let target = p.target_port.map(|tp| match tp {
+                                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n) => {
+                                    format!("-> {n}")
+                                }
+                                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s) => {
+                                    format!("-> {s}")
+                                }
+                            });
+                            out.push(AvailablePort {
+                                port,
+                                name: p.name,
+                                protocol: p.protocol.unwrap_or_else(|| "TCP".into()),
+                                detail: target,
+                            });
+                        }
+                    }
+                }
+            } else {
+                let pod = Api::<Pod>::namespaced(client, &namespace).get(&name).await?;
+                if let Some(containers) = pod.spec.map(|s| s.containers) {
+                    for c in containers {
+                        for p in c.ports.into_iter().flatten() {
+                            if let Ok(port) = u16::try_from(p.container_port) {
+                                out.push(AvailablePort {
+                                    port,
+                                    name: p.name,
+                                    protocol: p.protocol.unwrap_or_else(|| "TCP".into()),
+                                    detail: Some(c.name.clone()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<_, Error>(out)
+        }
+        .await
+        .map_err(|e| e.to_string());
+
+        let _ = tx.send(AppEvent::PortsLoaded {
+            context,
+            namespace,
+            kind,
+            name,
+            result: res,
         });
     });
 }

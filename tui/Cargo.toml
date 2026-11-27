@@ -28,6 +28,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 base64 = "0.23.1"
 http = "1"
 regex = "1"
+arboard = "3"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"

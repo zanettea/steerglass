@@ -8,7 +8,7 @@ use tokio::task::AbortHandle;
 use crate::core::health::{Issue, Scan};
 use crate::core::kubeconfig::{ContextInfo, TuiViewState};
 use crate::core::rows::{Health, Row};
-use crate::core::state::{AppState, KindRef};
+use crate::core::state::{AppState, ForwardInfo, KindRef};
 use crate::env::{Env, EnvChoice, resolve_env};
 use crate::k8s::{self, AppEvent, ClusterSummary, WatchUpdate};
 
@@ -16,6 +16,19 @@ use crate::k8s::{self, AppEvent, ClusterSummary, WatchUpdate};
 pub enum Screen {
     Overview,
     Resources,
+    Utilization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilizationPane {
+    Nodes,
+    Pods,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilizationSort {
+    CpuDesc,
+    MemDesc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,12 +72,172 @@ pub struct TableRow {
     pub row: Row,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardTarget {
+    pub bind_addr: String,
+    pub local_port: Option<u16>,
+    pub remote_port: u16,
+}
+
+pub fn parse_port_forward_input(
+    input: &str,
+    default_remote: Option<u16>,
+) -> std::result::Result<PortForwardTarget, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return match default_remote {
+            Some(remote_port) => Ok(PortForwardTarget {
+                bind_addr: "127.0.0.1".into(),
+                local_port: None,
+                remote_port,
+            }),
+            None => Err("Enter a port (e.g. 8080, 8080:80, or 0.0.0.0:8080:80)".into()),
+        };
+    }
+
+    // Check if input is just a bind IP (e.g. "0.0.0.0") when a default remote port is selected.
+    if let Ok(ip) = trimmed
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        if let Some(remote_port) = default_remote {
+            return Ok(PortForwardTarget {
+                bind_addr: ip.to_string(),
+                local_port: None,
+                remote_port,
+            });
+        }
+    }
+
+    // Handle "[ipv6]:local:remote" or "ipv4:local:remote" or "local:remote" or "remote".
+    let (bind_addr, rest) = if let Some(after_bracket) = trimmed.strip_prefix('[') {
+        let Some((addr, tail)) = after_bracket.split_once("]:") else {
+            return Err("Invalid IPv6 bind syntax (use [::1]:8080:80)".into());
+        };
+        let _: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| format!("Invalid IPv6 bind address: {addr}"))?;
+        (addr.to_string(), tail)
+    } else {
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        if parts.len() == 3 {
+            let _: std::net::IpAddr = parts[0]
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid bind address: {}", parts[0]))?;
+            (
+                parts[0].trim().to_string(),
+                &trimmed[parts[0].len() + 1..],
+            )
+        } else if parts.len() <= 2 {
+            ("127.0.0.1".to_string(), trimmed)
+        } else {
+            return Err("Invalid format (use 8080, 8080:80, or 0.0.0.0:8080:80)".into());
+        }
+    };
+
+    if let Some((local_s, remote_s)) = rest.split_once(':') {
+        let local = if local_s.trim().is_empty() || local_s.trim() == "0" {
+            None
+        } else {
+            let p: u16 = local_s
+                .trim()
+                .parse()
+                .map_err(|_| "Invalid local port".to_string())?;
+            Some(p)
+        };
+        let remote: u16 = if remote_s.trim().is_empty() {
+            default_remote.ok_or_else(|| "Invalid remote port".to_string())?
+        } else {
+            remote_s
+                .trim()
+                .parse()
+                .map_err(|_| "Invalid remote port".to_string())?
+        };
+        if remote == 0 {
+            return Err("Remote port must be > 0".into());
+        }
+        Ok(PortForwardTarget {
+            bind_addr,
+            local_port: local,
+            remote_port: remote,
+        })
+    } else {
+        let remote: u16 = rest
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid port (use 8080, 8080:80, or 0.0.0.0:8080:80)".to_string())?;
+        if remote == 0 {
+            return Err("Port must be > 0".into());
+        }
+        Ok(PortForwardTarget {
+            bind_addr,
+            local_port: None,
+            remote_port: remote,
+        })
+    }
+}
+
 pub fn yaml_lines_for_mode(raw: &[String], mode: YamlViewMode) -> Vec<String> {
     match mode {
         YamlViewMode::Raw => raw.to_vec(),
         YamlViewMode::Decoded => decode_yaml_data_lines(raw),
         YamlViewMode::Interpreted => crate::interpret::interpret_yaml_lines(raw),
     }
+}
+
+pub fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+
+    use base64::Engine;
+    use parking_lot::Mutex;
+
+    // Keep arboard::Clipboard alive for the process lifetime (required on X11/Wayland).
+    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    let mut copied_native = false;
+    let guard = CLIPBOARD.get_or_init(|| Mutex::new(arboard::Clipboard::new().ok()));
+    if let Some(cb) = guard.lock().as_mut() {
+        if cb.set_text(text.to_string()).is_ok() {
+            copied_native = true;
+        }
+    }
+
+    if !copied_native {
+        let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+            &[("pbcopy", &[])]
+        } else {
+            &[
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+            ]
+        };
+        for (bin, args) in candidates {
+            if let Ok(mut child) = Command::new(bin)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                if child.wait().is_ok_and(|s| s.success()) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Also emit OSC 52 (works over SSH / modern terminals even without X11/Wayland).
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{b64}\x1b\\");
+    let _ = stdout.flush();
 }
 
 pub fn decode_yaml_data_lines(raw: &[String]) -> Vec<String> {
@@ -240,6 +413,7 @@ pub enum Modal {
         raw_lines: Vec<String>,
         lines: Vec<String>,
         mode: YamlViewMode,
+        fullscreen: bool,
         scroll: usize,
         loading: bool,
         error: Option<String>,
@@ -251,6 +425,7 @@ pub enum Modal {
         container: Option<String>,
         containers: Vec<String>,
         lines: Vec<String>,
+        fullscreen: bool,
         scroll: usize,
         follow: bool,
         timestamps: bool,
@@ -282,11 +457,25 @@ pub enum Modal {
         target: String,
         editing_target: bool,
     },
+    PortForwardPrompt {
+        context: String,
+        namespace: String,
+        kind: String,
+        name: String,
+        input: String,
+        ports: Vec<k8s::AvailablePort>,
+        ports_loading: bool,
+        selected_port: usize,
+        active: Vec<ForwardInfo>,
+        selected_active: usize,
+        focus_active: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum PaletteItem {
     Overview,
+    Utilization,
     Kind(KindRef),
     Context(String),
     SetClusterEnv,
@@ -298,6 +487,7 @@ impl PaletteItem {
     pub fn label(&self) -> String {
         match self {
             PaletteItem::Overview => "Go to Overview".into(),
+            PaletteItem::Utilization => "View: Resource utilization (CPU / Memory)".into(),
             PaletteItem::Kind(k) => {
                 if k.group.is_empty() {
                     format!("Resource: {}", k.kind)
@@ -363,6 +553,12 @@ pub struct App {
     pub overview_split_pct: u16,
     pub dragging: Option<DragTarget>,
     pub term_size: (u16, u16),
+    pub utilization_by_ctx: BTreeMap<String, std::result::Result<k8s::ClusterUtilization, String>>,
+    pub utilization_loading: HashMap<String, bool>,
+    pub utilization_pane: UtilizationPane,
+    pub utilization_sort: UtilizationSort,
+    pub utilization_node_cursor: usize,
+    pub utilization_pod_cursor: usize,
 }
 
 impl App {
@@ -449,6 +645,12 @@ impl App {
             overview_split_pct: DEFAULT_OVERVIEW_SPLIT_PCT,
             dragging: None,
             term_size: (120, 40),
+            utilization_by_ctx: BTreeMap::new(),
+            utilization_loading: HashMap::new(),
+            utilization_pane: UtilizationPane::Nodes,
+            utilization_sort: UtilizationSort::CpuDesc,
+            utilization_node_cursor: 0,
+            utilization_pod_cursor: 0,
         };
 
         app.probe_all_overview();
@@ -504,7 +706,9 @@ impl App {
             self.selected_contexts = valid_contexts;
         }
 
-        if saved.screen == "resources" && !self.selected_contexts.is_empty() {
+        if saved.screen == "utilization" && !self.selected_contexts.is_empty() {
+            self.open_utilization();
+        } else if saved.screen == "resources" && !self.selected_contexts.is_empty() {
             if let Some(first) = self.selected_contexts.first() {
                 if let Some(pos) = self.contexts.iter().position(|c| &c.name == first) {
                     self.sidebar_cursor = pos + 1;
@@ -526,6 +730,7 @@ impl App {
             screen: match self.screen {
                 Screen::Overview => "overview".into(),
                 Screen::Resources => "resources".into(),
+                Screen::Utilization => "utilization".into(),
             },
             selected_contexts: self.selected_contexts.clone(),
             active_kind: Some(self.active_kind.clone()),
@@ -826,9 +1031,92 @@ impl App {
         kinds
     }
 
+    pub fn open_utilization(&mut self) {
+        self.screen = Screen::Utilization;
+        self.focus = Focus::Main;
+        self.refresh_utilization();
+    }
+
+    pub fn refresh_utilization(&mut self) {
+        let targets: Vec<String> = if self.selected_contexts.is_empty() {
+            self.contexts.first().map(|c| vec![c.name.clone()]).unwrap_or_default()
+        } else {
+            self.selected_contexts.clone()
+        };
+        for ctx in targets {
+            self.utilization_loading.insert(ctx.clone(), true);
+            k8s::spawn_utilization(self.state.clone(), ctx, self.tx.clone());
+        }
+    }
+
+    pub fn utilization_nodes(&self) -> Vec<(String, k8s::NodeUsageEntry)> {
+        let q = self.filter_text.trim().to_lowercase();
+        let mut out = Vec::new();
+        for ctx in &self.selected_contexts {
+            if let Some(Ok(u)) = self.utilization_by_ctx.get(ctx) {
+                for n in &u.nodes {
+                    if q.is_empty()
+                        || n.name.to_lowercase().contains(&q)
+                        || ctx.to_lowercase().contains(&q)
+                    {
+                        out.push((ctx.clone(), n.clone()));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| match self.utilization_sort {
+            UtilizationSort::CpuDesc => b
+                .1
+                .cpu_used
+                .unwrap_or(b.1.cpu_req)
+                .total_cmp(&a.1.cpu_used.unwrap_or(a.1.cpu_req)),
+            UtilizationSort::MemDesc => b
+                .1
+                .mem_used
+                .unwrap_or(b.1.mem_req)
+                .total_cmp(&a.1.mem_used.unwrap_or(a.1.mem_req)),
+        });
+        out
+    }
+
+    pub fn utilization_pods(&self) -> Vec<(String, k8s::PodUsageEntry)> {
+        let q = self.filter_text.trim().to_lowercase();
+        let mut out = Vec::new();
+        for ctx in &self.selected_contexts {
+            if let Some(Ok(u)) = self.utilization_by_ctx.get(ctx) {
+                for p in &u.pods {
+                    if q.is_empty()
+                        || p.name.to_lowercase().contains(&q)
+                        || p.namespace.to_lowercase().contains(&q)
+                        || ctx.to_lowercase().contains(&q)
+                        || p.node
+                            .as_deref()
+                            .is_some_and(|n| n.to_lowercase().contains(&q))
+                    {
+                        out.push((ctx.clone(), p.clone()));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| match self.utilization_sort {
+            UtilizationSort::CpuDesc => b
+                .1
+                .cpu_used
+                .unwrap_or(b.1.cpu_req)
+                .total_cmp(&a.1.cpu_used.unwrap_or(a.1.cpu_req)),
+            UtilizationSort::MemDesc => b
+                .1
+                .mem_used
+                .unwrap_or(b.1.mem_req)
+                .total_cmp(&a.1.mem_used.unwrap_or(a.1.mem_req)),
+        });
+        out
+    }
+
     pub fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
         let mut items = Vec::new();
         items.push(PaletteItem::Overview);
+        items.push(PaletteItem::Utilization);
         for k in self.available_kinds() {
             items.push(PaletteItem::Kind(k));
         }
@@ -866,6 +1154,52 @@ impl App {
             AppEvent::SummaryLoaded { context, result } => {
                 self.summary_loading.insert(context.clone(), false);
                 self.summaries.insert(context, result);
+            }
+            AppEvent::UtilizationLoaded { context, result } => {
+                self.utilization_loading.insert(context.clone(), false);
+                self.utilization_by_ctx.insert(context, result);
+            }
+            AppEvent::PortForwardStarted(res) => match res {
+                Ok(info) => {
+                    self.set_toast(
+                        format!(
+                            "Forwarding localhost:{} -> {}/{}:{}",
+                            info.local_port, info.namespace, info.target, info.remote_port
+                        ),
+                        false,
+                    );
+                }
+                Err(e) => self.set_toast(format!("Port-forward failed: {e}"), true),
+            },
+            AppEvent::PortsLoaded {
+                context,
+                namespace,
+                kind,
+                name,
+                result,
+            } => {
+                if let Modal::PortForwardPrompt {
+                    context: mc,
+                    namespace: mns,
+                    kind: mk,
+                    name: mn,
+                    ports,
+                    ports_loading,
+                    selected_port,
+                    ..
+                } = &mut self.modal
+                {
+                    if *mc == context && *mns == namespace && *mk == kind && *mn == name {
+                        *ports_loading = false;
+                        match result {
+                            Ok(list) => {
+                                *ports = list;
+                                *selected_port = 0;
+                            }
+                            Err(e) => self.set_toast(format!("Failed to load ports: {e}"), true),
+                        }
+                    }
+                }
             }
             AppEvent::IssuesLoaded { context, result } => {
                 if let Ok(list) = result {
@@ -1097,6 +1431,13 @@ impl App {
                     } else {
                         self.overview_pane = OverviewPane::Issues;
                     }
+                } else if self.screen == Screen::Utilization {
+                    let split_y = body_top + ((body_h as u32 * 40) / 100) as u16;
+                    if mouse.row < split_y {
+                        self.utilization_pane = UtilizationPane::Nodes;
+                    } else {
+                        self.utilization_pane = UtilizationPane::Pods;
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => match self.dragging {
@@ -1149,10 +1490,14 @@ impl App {
                 KeyCode::Backspace => {
                     self.filter_text.pop();
                     self.table_cursor = 0;
+                    self.utilization_node_cursor = 0;
+                    self.utilization_pod_cursor = 0;
                 }
                 KeyCode::Char(ch) => {
                     self.filter_text.push(ch);
                     self.table_cursor = 0;
+                    self.utilization_node_cursor = 0;
+                    self.utilization_pod_cursor = 0;
                 }
                 _ => {}
             }
@@ -1214,6 +1559,10 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Char('u') => {
+                self.open_utilization();
+                return;
+            }
             KeyCode::Char('R') => {
                 let report = self.state.reload();
                 let mut contexts = report.contexts;
@@ -1238,6 +1587,99 @@ impl App {
         match self.screen {
             Screen::Overview => self.handle_overview_key(key),
             Screen::Resources => self.handle_resources_key(key),
+            Screen::Utilization => self.handle_utilization_key(key),
+        }
+    }
+
+    fn handle_utilization_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.show_sidebar {
+                    self.focus = Focus::Sidebar;
+                }
+            }
+            KeyCode::Esc => {
+                if !self.filter_text.is_empty() {
+                    self.filter_text.clear();
+                    self.utilization_node_cursor = 0;
+                    self.utilization_pod_cursor = 0;
+                    self.save_view_state();
+                } else {
+                    self.screen = Screen::Overview;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.filter_active = true;
+            }
+            KeyCode::Char('o') | KeyCode::BackTab => {
+                self.utilization_pane = match self.utilization_pane {
+                    UtilizationPane::Nodes => UtilizationPane::Pods,
+                    UtilizationPane::Pods => UtilizationPane::Nodes,
+                };
+            }
+            KeyCode::Char('c') => {
+                self.utilization_sort = UtilizationSort::CpuDesc;
+                self.utilization_node_cursor = 0;
+                self.utilization_pod_cursor = 0;
+                self.set_toast("Sorted utilization by CPU", false);
+            }
+            KeyCode::Char('m') => {
+                self.utilization_sort = UtilizationSort::MemDesc;
+                self.utilization_node_cursor = 0;
+                self.utilization_pod_cursor = 0;
+                self.set_toast("Sorted utilization by Memory", false);
+            }
+            KeyCode::Char('r') => {
+                self.refresh_utilization();
+                self.set_toast("Refreshing utilization metrics...", false);
+            }
+            KeyCode::Up | KeyCode::Char('k') => match self.utilization_pane {
+                UtilizationPane::Nodes => {
+                    self.utilization_node_cursor = self.utilization_node_cursor.saturating_sub(1);
+                }
+                UtilizationPane::Pods => {
+                    self.utilization_pod_cursor = self.utilization_pod_cursor.saturating_sub(1);
+                }
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.utilization_pane {
+                UtilizationPane::Nodes => {
+                    let len = self.utilization_nodes().len();
+                    if self.utilization_node_cursor + 1 < len {
+                        self.utilization_node_cursor += 1;
+                    }
+                }
+                UtilizationPane::Pods => {
+                    let len = self.utilization_pods().len();
+                    if self.utilization_pod_cursor + 1 < len {
+                        self.utilization_pod_cursor += 1;
+                    }
+                }
+            },
+            KeyCode::Char('g') => match self.utilization_pane {
+                UtilizationPane::Nodes => self.utilization_node_cursor = 0,
+                UtilizationPane::Pods => self.utilization_pod_cursor = 0,
+            },
+            KeyCode::Char('G') => match self.utilization_pane {
+                UtilizationPane::Nodes => {
+                    self.utilization_node_cursor = self.utilization_nodes().len().saturating_sub(1);
+                }
+                UtilizationPane::Pods => {
+                    self.utilization_pod_cursor = self.utilization_pods().len().saturating_sub(1);
+                }
+            },
+            KeyCode::Enter => {
+                if self.utilization_pane == UtilizationPane::Pods {
+                    if let Some((ctx, pod)) = self.utilization_pods().get(self.utilization_pod_cursor) {
+                        if let Some(k) = self.available_kinds().into_iter().find(|k| k.kind == "Pod") {
+                            self.active_kind = k;
+                        }
+                        self.active_namespace = Some(pod.namespace.clone());
+                        self.filter_text = pod.name.clone();
+                        self.open_single_cluster(ctx.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1548,6 +1990,41 @@ impl App {
                     self.set_toast("Debug container is available for Pods and Nodes", true);
                 }
             }
+            KeyCode::Char('F') => {
+                if matches!(self.active_kind.kind.as_str(), "Pod" | "Service") {
+                    if let Some(tr) = rows.get(self.table_cursor) {
+                        if let Some(ns) = tr.row.namespace.clone() {
+                            let active = k8s::list_port_forwards(&self.state);
+                            let ctx = tr.context.clone();
+                            let kind = self.active_kind.kind.clone();
+                            let name = tr.row.name.clone();
+                            self.modal = Modal::PortForwardPrompt {
+                                context: ctx.clone(),
+                                namespace: ns.clone(),
+                                kind: kind.clone(),
+                                name: name.clone(),
+                                input: String::new(),
+                                ports: Vec::new(),
+                                ports_loading: true,
+                                selected_port: 0,
+                                active,
+                                selected_active: 0,
+                                focus_active: false,
+                            };
+                            k8s::spawn_available_ports(
+                                self.state.clone(),
+                                ctx,
+                                ns,
+                                kind,
+                                name,
+                                self.tx.clone(),
+                            );
+                        }
+                    }
+                } else {
+                    self.set_toast("Port-forward is available for Pods and Services", true);
+                }
+            }
             KeyCode::Char('E') => {
                 if let Some(tr) = rows.get(self.table_cursor) {
                     let state = self.state.clone();
@@ -1686,6 +2163,7 @@ impl App {
             raw_lines: Vec::new(),
             lines: Vec::new(),
             mode,
+            fullscreen: false,
             scroll: 0,
             loading: true,
             error: None,
@@ -1706,6 +2184,7 @@ impl App {
             container: None,
             containers: Vec::new(),
             lines: Vec::new(),
+            fullscreen: false,
             scroll: 0,
             follow: true,
             timestamps: false,
@@ -1808,6 +2287,9 @@ impl App {
                             PaletteItem::Overview => {
                                 self.screen = Screen::Overview;
                             }
+                            PaletteItem::Utilization => {
+                                self.open_utilization();
+                            }
                             PaletteItem::Kind(k) => {
                                 self.active_kind = k;
                                 if self.selected_contexts.is_empty() {
@@ -1889,6 +2371,7 @@ impl App {
                 raw_lines,
                 lines,
                 mode,
+                fullscreen,
                 scroll,
                 ..
             } => match key.code {
@@ -1929,6 +2412,19 @@ impl App {
                     *lines = yaml_lines_for_mode(raw_lines, *mode);
                     *scroll = if lines.is_empty() { 0 } else { (*scroll).min(lines.len() - 1) };
                 }
+                KeyCode::Char('c') => {
+                    let count = lines.len();
+                    let content = lines.join("\n");
+                    copy_to_clipboard(&content);
+                    self.toast = Some((
+                        format!("Copied {count} lines to clipboard"),
+                        false,
+                        std::time::Instant::now(),
+                    ));
+                }
+                KeyCode::Char('z') => {
+                    *fullscreen = !*fullscreen;
+                }
                 KeyCode::Char('E') => {
                     let yaml = raw_lines.join("\n");
                     self.pending_external = Some(PendingExternal::EditYaml {
@@ -1943,6 +2439,7 @@ impl App {
             },
             Modal::LogsViewer {
                 lines,
+                fullscreen,
                 scroll,
                 follow,
                 timestamps,
@@ -1990,6 +2487,9 @@ impl App {
                         if *follow {
                             *scroll = lines.len().saturating_sub(1);
                         }
+                    }
+                    KeyCode::Char('z') => {
+                        *fullscreen = !*fullscreen;
                     }
                     KeyCode::Char('t') => {
                         *timestamps = !*timestamps;
@@ -2139,6 +2639,91 @@ impl App {
                 }
                 _ => {}
             },
+            Modal::PortForwardPrompt {
+                context,
+                namespace,
+                kind,
+                name,
+                input,
+                ports,
+                selected_port,
+                active,
+                selected_active,
+                focus_active,
+                ..
+            } => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Tab => {
+                    if !active.is_empty() {
+                        *focus_active = !*focus_active;
+                    }
+                }
+                KeyCode::Up => {
+                    if *focus_active {
+                        *selected_active = selected_active.saturating_sub(1);
+                    } else {
+                        *selected_port = selected_port.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if *focus_active {
+                        if *selected_active + 1 < active.len() {
+                            *selected_active += 1;
+                        }
+                    } else if *selected_port + 1 < ports.len() {
+                        *selected_port += 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(f) = active.get(*selected_active).cloned() {
+                        k8s::stop_port_forward(&self.state, f.id);
+                        *active = k8s::list_port_forwards(&self.state);
+                        if !active.is_empty() {
+                            *selected_active = (*selected_active).min(active.len() - 1);
+                        } else {
+                            *selected_active = 0;
+                            *focus_active = false;
+                        }
+                        self.set_toast(
+                            format!("Stopped forward localhost:{}", f.local_port),
+                            false,
+                        );
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) if ch.is_ascii_digit() || matches!(ch, ':' | '.' | '[' | ']') => {
+                    input.push(ch);
+                }
+                KeyCode::Enter => {
+                    let default_remote = ports.get(*selected_port).map(|p| p.port);
+                    match parse_port_forward_input(input, default_remote) {
+                        Ok(target) => {
+                            let (ctx, ns, k, nm) = (
+                                context.clone(),
+                                namespace.clone(),
+                                kind.clone(),
+                                name.clone(),
+                            );
+                            self.modal = Modal::None;
+                            k8s::spawn_port_forward(
+                                self.state.clone(),
+                                ctx,
+                                ns,
+                                k,
+                                nm,
+                                target.remote_port,
+                                target.local_port,
+                                target.bind_addr,
+                                self.tx.clone(),
+                            );
+                        }
+                        Err(e) => self.set_toast(e, true),
+                    }
+                }
+                _ => {}
+            },
         }
     }
 
@@ -2185,9 +2770,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn test_app() -> App {
-        let state = Arc::new(AppState::new(
-            std::env::temp_dir().join("steerglass-tui-unit-test/settings.json"),
-        ));
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("steerglass-tui-unit-test-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = Arc::new(AppState::new(dir.join("settings.json")));
         let (tx, _rx) = mpsc::unbounded_channel();
         App::new(state, tx, None)
     }
@@ -2885,5 +3472,164 @@ mod tests {
             }
             _ => panic!("expected YamlViewer"),
         }
+
+        // Press 'z' inside YamlViewer -> toggles fullscreen
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert!(matches!(app.modal, Modal::YamlViewer { fullscreen: true, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert!(matches!(app.modal, Modal::YamlViewer { fullscreen: false, .. }));
+
+        // Press 'c' inside YamlViewer -> copies displayed content and shows toast
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(msg, is_err, _)| !is_err && msg.contains("Copied"))
+        );
+    }
+
+    #[tokio::test]
+    async fn utilization_view_sorts_nodes_and_pods_by_cpu_and_memory() {
+        let mut app = test_app();
+        app.selected_contexts = vec!["ctx".into()];
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(app.screen, Screen::Utilization);
+
+        app.handle_event(AppEvent::UtilizationLoaded {
+            context: "ctx".into(),
+            result: Ok(k8s::ClusterUtilization {
+                metrics_available: true,
+                nodes: vec![
+                    k8s::NodeUsageEntry {
+                        name: "node-a".into(),
+                        cpu_used: Some(0.5),
+                        cpu_req: 0.4,
+                        cpu_alloc: 4.0,
+                        mem_used: Some(4.0 * 1073741824.0),
+                        mem_req: 2.0 * 1073741824.0,
+                        mem_alloc: 8.0 * 1073741824.0,
+                        pods: 3,
+                    },
+                    k8s::NodeUsageEntry {
+                        name: "node-b".into(),
+                        cpu_used: Some(2.0),
+                        cpu_req: 1.5,
+                        cpu_alloc: 4.0,
+                        mem_used: Some(1.0 * 1073741824.0),
+                        mem_req: 0.5 * 1073741824.0,
+                        mem_alloc: 8.0 * 1073741824.0,
+                        pods: 5,
+                    },
+                ],
+                pods: vec![
+                    k8s::PodUsageEntry {
+                        namespace: "default".into(),
+                        name: "mem-hog".into(),
+                        node: Some("node-a".into()),
+                        cpu_used: Some(0.1),
+                        cpu_req: 0.1,
+                        cpu_lim: None,
+                        mem_used: Some(2.0 * 1073741824.0),
+                        mem_req: 1.0 * 1073741824.0,
+                        mem_lim: None,
+                    },
+                    k8s::PodUsageEntry {
+                        namespace: "default".into(),
+                        name: "cpu-hog".into(),
+                        node: Some("node-b".into()),
+                        cpu_used: Some(1.5),
+                        cpu_req: 1.0,
+                        cpu_lim: Some(2.0),
+                        mem_used: Some(128.0 * 1048576.0),
+                        mem_req: 128.0 * 1048576.0,
+                        mem_lim: Some(256.0 * 1048576.0),
+                    },
+                ],
+            }),
+        });
+
+        // Default sort: CPU desc -> node-b, cpu-hog first
+        assert_eq!(app.utilization_nodes()[0].1.name, "node-b");
+        assert_eq!(app.utilization_pods()[0].1.name, "cpu-hog");
+
+        // Press 'm' -> Memory desc -> node-a, mem-hog first
+        app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+        assert_eq!(app.utilization_nodes()[0].1.name, "node-a");
+        assert_eq!(app.utilization_pods()[0].1.name, "mem-hog");
+
+        // Filter with '/' -> filters both nodes and pods (e.g. by node name or pod name)
+        app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        for ch in "node-b".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.utilization_nodes().len(), 1);
+        assert_eq!(app.utilization_nodes()[0].1.name, "node-b");
+        assert_eq!(app.utilization_pods().len(), 1);
+        assert_eq!(app.utilization_pods()[0].1.name, "cpu-hog");
+    }
+
+    #[tokio::test]
+    async fn shift_f_opens_port_forward_prompt_and_parses_ports() {
+        assert_eq!(
+            parse_port_forward_input("8080", None),
+            Ok(PortForwardTarget {
+                bind_addr: "127.0.0.1".into(),
+                local_port: None,
+                remote_port: 8080,
+            })
+        );
+        assert_eq!(
+            parse_port_forward_input("8080:80", None),
+            Ok(PortForwardTarget {
+                bind_addr: "127.0.0.1".into(),
+                local_port: Some(8080),
+                remote_port: 80,
+            })
+        );
+        assert_eq!(
+            parse_port_forward_input("0.0.0.0:9090:80", None),
+            Ok(PortForwardTarget {
+                bind_addr: "0.0.0.0".into(),
+                local_port: Some(9090),
+                remote_port: 80,
+            })
+        );
+        assert_eq!(
+            parse_port_forward_input("[::1]:9090:80", None),
+            Ok(PortForwardTarget {
+                bind_addr: "::1".into(),
+                local_port: Some(9090),
+                remote_port: 80,
+            })
+        );
+        assert_eq!(
+            parse_port_forward_input("0.0.0.0", Some(8080)),
+            Ok(PortForwardTarget {
+                bind_addr: "0.0.0.0".into(),
+                local_port: None,
+                remote_port: 8080,
+            })
+        );
+        assert!(parse_port_forward_input("", None).is_err());
+        assert!(parse_port_forward_input("0", None).is_err());
+
+        let mut app = test_app();
+        app.screen = Screen::Resources;
+        app.focus = Focus::Main;
+        app.selected_contexts = vec!["ctx".into()];
+        let mut map = HashMap::new();
+        map.insert("1".into(), sample_row("1", "web-0", "default", Health::Ok, vec![]));
+        app.rows_by_ctx.insert("ctx".into(), map);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+        assert!(matches!(
+            app.modal,
+            Modal::PortForwardPrompt {
+                ref kind,
+                ref name,
+                ..
+            } if kind == "Pod" && name == "web-0"
+        ));
     }
 }

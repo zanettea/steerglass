@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use crate::app::{App, PendingExternal};
+use crate::app::{App, Modal, PendingExternal};
 use crate::core::commands::dyn_api;
 use crate::core::state::AppState;
 
@@ -116,9 +116,20 @@ async fn run_loop(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<k8s::AppEvent>,
 ) -> io::Result<()> {
+    let mut mouse_captured = true;
     loop {
         while let Ok(ev) = rx.try_recv() {
             app.handle_event(ev);
+        }
+
+        let wants_mouse = !matches!(app.modal, Modal::YamlViewer { .. } | Modal::LogsViewer { .. });
+        if wants_mouse != mouse_captured {
+            if wants_mouse {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            mouse_captured = wants_mouse;
         }
 
         if let Ok(sz) = terminal.size() {
@@ -128,6 +139,7 @@ async fn run_loop(
 
         if let Some(ext) = app.pending_external.take() {
             run_external(terminal, app, ext).await?;
+            mouse_captured = true;
             continue;
         }
 
