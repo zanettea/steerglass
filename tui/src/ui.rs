@@ -7,10 +7,10 @@ use ratatui::widgets::{
     TableState, Wrap,
 };
 
-use crate::app::{App, ConfirmKind, Focus, Modal, OverviewPane, Screen};
+use crate::app::{App, ConfirmKind, Focus, Modal, OverviewPane, Screen, YamlViewMode};
 use crate::core::health::Severity;
 use crate::core::rows::{self, Health};
-use crate::env::detect_env;
+use crate::env::{EnvChoice, detect_env};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -28,9 +28,11 @@ pub fn render(f: &mut Frame, app: &App) {
     render_header(f, app, root[0]);
 
     if app.show_sidebar {
+        let max_w = f.area().width.saturating_sub(20).max(16);
+        let sidebar_w = app.sidebar_width.clamp(16, max_w);
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(30), Constraint::Min(30)])
+            .constraints([Constraint::Length(sidebar_w), Constraint::Min(20)])
             .split(root[1]);
         render_sidebar(f, app, body[0]);
         render_main(f, app, body[1]);
@@ -73,7 +75,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                     if i > 0 {
                         spans.push(Span::styled(" + ", Style::default().fg(DIM)));
                     }
-                    if let Some(env) = detect_env(ctx) {
+                    if let Some(env) = app.context_env(ctx) {
                         spans.push(Span::styled(
                             format!("[{}] ", env.tag()),
                             Style::default().fg(env.color()).add_modifier(Modifier::BOLD),
@@ -159,7 +161,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(mark, Style::default().fg(ACCENT)),
             Span::styled(num, Style::default().fg(DIM)),
         ];
-        if let Some(env) = detect_env(&ctx.name) {
+        if let Some(env) = app.context_env(&ctx.name) {
             spans.push(Span::styled(
                 format!("{} ", env.tag()),
                 Style::default().fg(env.color()).add_modifier(Modifier::BOLD),
@@ -195,15 +197,19 @@ fn render_main(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_overview(f: &mut Frame, app: &App, area: Rect) {
+    let top_pct = app.overview_split_pct.clamp(20, 80);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints([
+            Constraint::Percentage(top_pct),
+            Constraint::Percentage(100 - top_pct),
+        ])
         .split(area);
 
     // Top: Clusters summary table
     let clusters_focused = app.focus == Focus::Main && app.overview_pane == OverviewPane::Clusters;
     let block = Block::default()
-        .title(" Clusters (Enter: open, Space: multi-select, s: scan all kinds, o: switch pane) ")
+        .title(" Clusters (Enter: open, Space: multi-select, e: env, s: scan, o: pane) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if clusters_focused { ACCENT } else { DIM }));
 
@@ -231,7 +237,7 @@ fn render_overview(f: &mut Frame, app: &App, area: Rect) {
             .contexts
             .iter()
             .map(|c| {
-                let env_cell = match detect_env(&c.name) {
+                let env_cell = match app.context_env(&c.name) {
                     Some(e) => Cell::from(e.tag()).style(Style::default().fg(e.color()).add_modifier(Modifier::BOLD)),
                     None => Cell::from("-").style(Style::default().fg(DIM)),
                 };
@@ -414,7 +420,12 @@ fn render_resources(f: &mut Frame, app: &App, area: Rect) {
         headers.push(Cell::from(*col));
         widths.push(Constraint::Min(10));
     }
-    headers.push(Cell::from("Age"));
+    let age_header = match app.resource_sort {
+        crate::app::ResourceSort::NameAsc => "Age",
+        crate::app::ResourceSort::AgeNewestFirst => "Age ↓",
+        crate::app::ResourceSort::AgeOldestFirst => "Age ↑",
+    };
+    headers.push(Cell::from(age_header));
     widths.push(Constraint::Length(7));
 
     let header_row = TuiRow::new(headers)
@@ -431,7 +442,7 @@ fn render_resources(f: &mut Frame, app: &App, area: Rect) {
             };
             let mut cells = Vec::new();
             if multi {
-                let env_col = detect_env(&tr.context)
+                let env_col = app.context_env(&tr.context)
                     .map(|e| e.color())
                     .unwrap_or(Color::White);
                 cells.push(Cell::from(tr.context.as_str()).style(Style::default().fg(env_col)));
@@ -499,8 +510,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = match app.screen {
-        Screen::Overview => "0 Overview  1-9 Cluster  Tab Sidebar  o Switch Pane  Enter Open  Space Multi-select  s Scan  : Palette  ? Help  q Quit",
-        Screen::Resources => ":/Ctrl+K Palette  / Filter  n Namespace  [/] Kind  Enter/y YAML  l Logs  s Shell  E Edit  r Restart  S Scale  d Delete  ? Help  q Quit",
+        Screen::Overview => "0 Overview  1-9 Cluster  J/K Move  e Env  Tab Sidebar  o Pane  Enter Open  Space Multi  s Scan  : Palette  ? Help  q Quit",
+        Screen::Resources => ":/Ctrl+K Palette  / Filter  A Age-sort  n Namespace  [/] Kind  Enter/y YAML  l Logs  s Shell  D Debug  E Edit  d Delete  ? Help  q Quit",
     };
 
     let p = Paragraph::new(Line::from(Span::styled(keys, Style::default().fg(DIM))))
@@ -512,13 +523,15 @@ fn render_modal(f: &mut Frame, app: &App) {
     match &app.modal {
         Modal::None => {}
         Modal::Help => {
-            let area = centered_rect(72, 75, f.area());
+            let area = centered_rect(76, 85, f.area());
             f.render_widget(Clear, area);
             let lines = vec![
                 Line::from(Span::styled("Steerglass TUI Shortcuts", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from("  0            Go to Multi-Cluster Overview"),
                 Line::from("  1..9         Jump to Cluster N"),
+                Line::from("  J / K / S-↑↓ Move cluster down / up (Sidebar or Overview, saved)"),
+                Line::from("  e            Change cluster environment classification (Sidebar or Overview)"),
                 Line::from("  Tab / h / l  Switch focus between Sidebar and Main"),
                 Line::from("  b            Toggle Sidebar"),
                 Line::from("  Space / m    Toggle cluster in Multi-Cluster view"),
@@ -526,16 +539,20 @@ fn render_modal(f: &mut Frame, app: &App) {
                 Line::from("  [ / ]        Previous / Next built-in resource kind"),
                 Line::from("  n            Pick Namespace"),
                 Line::from("  /            Filter table (supports status:bad, status:error, status:warn)"),
+                Line::from("  A (Shift+A)  Sort by Age (newest first / oldest first / name)"),
                 Line::from("  j / k / ↑ /↓ Navigate rows (g/G top/bottom, PgUp/PgDn)"),
                 Line::from("  Enter / y    View YAML"),
+                Line::from("  x / i        Decode Secret data / Interpret certs, JSON, JWT"),
                 Line::from("  E            Edit YAML in $EDITOR and apply"),
                 Line::from("  l            Pod Logs (f: follow, t: timestamps, c: container)"),
                 Line::from("  s            Pod Shell (kubectl exec -it) / Overview: full scan"),
+                Line::from("  D (Shift+D)  Debug container (kubectl debug on Pod or Node)"),
                 Line::from("  r            Rollout Restart (Deployment/StatefulSet/DaemonSet)"),
                 Line::from("  S            Scale replicas (Deployment/StatefulSet/ReplicaSet)"),
                 Line::from("  c / p        Node Cordon/Uncordon  |  CronJob Suspend/Resume"),
                 Line::from("  d / Del      Delete resource (PROD requires typing name)"),
                 Line::from("  R            Reload kubeconfig"),
+                Line::from("  Ctrl+Z       Suspend TUI (fg to resume)"),
                 Line::from("  q / Ctrl+C   Quit"),
             ];
             let p = Paragraph::new(lines)
@@ -621,6 +638,7 @@ fn render_modal(f: &mut Frame, app: &App) {
             kind,
             name,
             lines,
+            mode,
             scroll,
             loading,
             error,
@@ -628,7 +646,15 @@ fn render_modal(f: &mut Frame, app: &App) {
         } => {
             let area = centered_rect(88, 86, f.area());
             f.render_widget(Clear, area);
-            let title = format!(" YAML: {context} / {} / {name} (j/k scroll, E $EDITOR, Esc close) ", kind.kind);
+            let mode_tag = match mode {
+                YamlViewMode::Raw => "",
+                YamlViewMode::Decoded => " [DECODED]",
+                YamlViewMode::Interpreted => " [INTERPRETED]",
+            };
+            let title = format!(
+                " YAML: {context} / {} / {name}{mode_tag} (j/k scroll, x decode, i interpret, E $EDITOR, Esc close) ",
+                kind.kind
+            );
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -820,6 +846,145 @@ fn render_modal(f: &mut Frame, app: &App) {
             let p = Paragraph::new(lines)
                 .block(Block::default().title(" Scale ").borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
             f.render_widget(p, area);
+        }
+        Modal::EnvPicker { context, selected } => {
+            let area = centered_rect(54, 38, f.area());
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .title(format!(" Environment: {} (Enter to save, Esc to cancel) ", truncate(context, 32)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(1)])
+                .split(inner);
+
+            let auto_str = match detect_env(context) {
+                Some(e) => e.tag(),
+                None => "None",
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Auto-detected: ", Style::default().fg(DIM)),
+                    Span::styled(auto_str, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ])),
+                chunks[0],
+            );
+
+            let items: Vec<ListItem> = EnvChoice::ALL
+                .iter()
+                .map(|&choice| {
+                    let style = match choice.env().or_else(|| {
+                        if choice == EnvChoice::Auto {
+                            detect_env(context)
+                        } else {
+                            None
+                        }
+                    }) {
+                        Some(env) => Style::default().fg(env.color()),
+                        None => Style::default().fg(Color::Gray),
+                    };
+                    let label = if choice == EnvChoice::Auto {
+                        format!("Auto ({auto_str})")
+                    } else {
+                        choice.label().to_string()
+                    };
+                    ListItem::new(Span::styled(label, style))
+                })
+                .collect();
+            let mut state = ListState::default();
+            state.select(Some((*selected).min(EnvChoice::ALL.len().saturating_sub(1))));
+            let list = List::new(items).highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 41, 59))
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_stateful_widget(list, chunks[1], &mut state);
+        }
+        Modal::DebugPrompt {
+            name,
+            is_node,
+            selected_preset,
+            custom_image,
+            target,
+            editing_target,
+            ..
+        } => {
+            let area = centered_rect(58, if *is_node { 36 } else { 42 }, f.area());
+            f.render_widget(Clear, area);
+            let kind_label = if *is_node { "Node" } else { "Pod" };
+            let block = Block::default()
+                .title(format!(" Debug {kind_label}: {} ", truncate(name, 32)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let mut constraints = vec![Constraint::Min(1)];
+            if !*is_node {
+                constraints.push(Constraint::Length(3));
+            }
+            constraints.push(Constraint::Length(2));
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(inner);
+
+            let mut items: Vec<ListItem> = crate::app::DEBUG_IMAGES
+                .iter()
+                .map(|img| ListItem::new(*img))
+                .collect();
+            let custom_label = if *selected_preset == crate::app::DEBUG_IMAGES.len() && !*editing_target {
+                format!("Custom: {custom_image}▌")
+            } else if custom_image.is_empty() {
+                "Custom image…".to_string()
+            } else {
+                format!("Custom: {custom_image}")
+            };
+            items.push(ListItem::new(custom_label));
+
+            let mut state = ListState::default();
+            state.select(Some((*selected_preset).min(items.len().saturating_sub(1))));
+            let list = List::new(items).highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 41, 59))
+                    .fg(if *editing_target { Color::Gray } else { ACCENT })
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_stateful_widget(list, chunks[0], &mut state);
+
+            let hint_idx = if !*is_node {
+                let tgt_style = if *editing_target {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let cursor = if *editing_target { "▌" } else { "" };
+                let tgt_line = Line::from(vec![
+                    Span::styled("Target container (optional): ", Style::default().fg(DIM)),
+                    Span::styled(format!("{target}{cursor}"), tgt_style),
+                ]);
+                f.render_widget(
+                    Paragraph::new(tgt_line).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(DIM))),
+                    chunks[1],
+                );
+                2
+            } else {
+                1
+            };
+
+            let hint = if *is_node {
+                "↑/↓ Image  Enter Start kubectl debug  Esc Cancel"
+            } else {
+                "↑/↓ Image  Tab Target container  Enter Start kubectl debug  Esc Cancel"
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM)))),
+                chunks[hint_idx],
+            );
         }
     }
 }

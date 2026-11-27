@@ -3,6 +3,24 @@ use std::path::{Path, PathBuf};
 use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
 
+/// Persisted TUI view state and filters so restarts resume where the user left off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TuiViewState {
+    pub cli_context: Option<String>,
+    pub cli_kubeconfig: Option<String>,
+    pub screen: String,
+    pub selected_contexts: Vec<String>,
+    pub active_kind: Option<crate::state::KindRef>,
+    pub active_namespace: Option<String>,
+    pub filter_text: String,
+    pub resource_sort: String,
+    pub show_sidebar: bool,
+    pub overview_pane: String,
+    pub sidebar_width: Option<u16>,
+    pub overview_split_pct: Option<u16>,
+}
+
 /// User settings that affect where kubeconfig files are read from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -15,10 +33,18 @@ pub struct Settings {
     pub excluded_kubeconfigs: Vec<PathBuf>,
     /// Contexts the user hid from the sidebar and the overview.
     pub hidden_contexts: Vec<String>,
+    /// Preferred display and 1..9 shortcut order for contexts.
+    pub context_order: Vec<String>,
+    /// User-selected environment classification per context ("prod", "stage", "dev", "local", "none").
+    /// Contexts not listed are auto-detected from their name.
+    pub context_envs: std::collections::BTreeMap<String, String>,
     /// macOS security-scoped bookmarks (path -> base64 data) for files and folders the user granted.
     pub bookmarks: std::collections::BTreeMap<String, String>,
     /// Optional AI help (off by default); the API key is kept in the system keychain.
     pub ai: crate::ai::AiSettings,
+    /// Last TUI view state / filters for resuming across restarts when CLI args match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tui_view: Option<TuiViewState>,
 }
 
 impl Default for Settings {
@@ -28,8 +54,11 @@ impl Default for Settings {
             scan_kube_dir: true,
             excluded_kubeconfigs: vec![],
             hidden_contexts: vec![],
+            context_order: vec![],
+            context_envs: Default::default(),
             bookmarks: Default::default(),
             ai: Default::default(),
+            tui_view: None,
         }
     }
 }
@@ -160,7 +189,9 @@ pub fn stamp(settings: &Settings) -> Stamp {
 
 pub fn load(settings: &Settings) -> Loaded {
     let mut merged: Option<Kubeconfig> = None;
-    let mut contexts = Vec::new();
+    // (current_name, source_path, file_label, original_name)
+    let mut contexts: Vec<(String, String, String, String)> = Vec::new();
+    let mut conflicted_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut files = Vec::new();
     let mut errors = Vec::new();
 
@@ -173,14 +204,16 @@ pub fn load(settings: &Settings) -> Loaded {
         match Kubeconfig::read_from(&path) {
             Ok(mut kc) => {
                 let source = path.display().to_string();
-                if let Some(m) = &merged {
-                    disambiguate(&mut kc, m, &file_label(&path));
+                let label = file_label(&path);
+                let orig_names: Vec<String> = kc.contexts.iter().map(|c| c.name.clone()).collect();
+                if let Some(m) = &mut merged {
+                    disambiguate(&mut kc, m, &mut contexts, &mut conflicted_names, &label);
                 }
-                for ctx in &kc.contexts {
-                    if contexts.iter().any(|c: &(String, String)| c.0 == ctx.name) {
+                for (ctx, orig) in kc.contexts.iter().zip(orig_names.into_iter()) {
+                    if contexts.iter().any(|c| c.0 == ctx.name) {
                         continue;
                     }
-                    contexts.push((ctx.name.clone(), source.clone()));
+                    contexts.push((ctx.name.clone(), source.clone(), label.clone(), orig));
                 }
                 files.push(source);
                 merged = Some(match merged.take() {
@@ -201,11 +234,11 @@ pub fn load(settings: &Settings) -> Loaded {
     let config = merged.unwrap_or_default();
     let current = config.current_context.clone();
     let (hidden, contexts): (Vec<_>, Vec<_>) =
-        contexts.into_iter().partition(|(name, _)| settings.hidden_contexts.contains(name));
-    let hidden = hidden.into_iter().map(|(name, _)| name).collect();
+        contexts.into_iter().partition(|(name, ..)| settings.hidden_contexts.contains(name));
+    let hidden = hidden.into_iter().map(|(name, ..)| name).collect();
     let infos = contexts
         .into_iter()
-        .filter_map(|(name, source)| {
+        .filter_map(|(name, source, _, _)| {
             let named = config.contexts.iter().find(|c| c.name == name)?;
             let ctx = named.context.as_ref()?;
             let server = config
@@ -232,20 +265,30 @@ pub fn load(settings: &Settings) -> Loaded {
 /// How a file is named in renamed contexts: `k3s-lab` for `~/.kube/k3s-lab.yaml`, `lab/config` for a
 /// file called just `config`.
 fn file_label(path: &Path) -> String {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("kubeconfig");
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("kubeconfig");
+    let stem = name
+        .strip_suffix(".yaml")
+        .or_else(|| name.strip_suffix(".yml"))
+        .unwrap_or(name);
     match path.parent().and_then(|p| p.file_name()).and_then(|p| p.to_str()) {
-        Some(dir) if stem == "config" => format!("{dir}/{stem}"),
+        Some(dir) if stem == "config" || stem.starts_with("config.") => format!("{dir}/{stem}"),
         _ => stem.to_string(),
     }
 }
 
 /// Renames what `next` defines under a name `merged` already uses for something else, so the merge
 /// keeps it instead of silently dropping it: several k3s files all call their context, cluster and user
-/// `default`, and kubectl's rules would keep only the first. A context becomes `default (k3s-lab)`, after
-/// its file; its cluster and user are renamed the same way. Identical entries (a copy of the same
-/// kubeconfig) are left alone and merge into one, like kubectl. Only the merged copy in memory changes,
-/// never the files.
-fn disambiguate(next: &mut Kubeconfig, merged: &Kubeconfig, label: &str) {
+/// `default`, and kubectl's rules would keep only the first. When contexts conflict, both the existing
+/// and new entries are renamed (`default (k3s-a)` and `default (k3s-b)`). Identical entries (a copy of
+/// the same kubeconfig) are left alone and merge into one, like kubectl. Only the merged copy in memory
+/// changes, never the files.
+fn disambiguate(
+    next: &mut Kubeconfig,
+    merged: &mut Kubeconfig,
+    merged_contexts: &mut [(String, String, String, String)],
+    conflicted_names: &mut std::collections::HashSet<String>,
+    label: &str,
+) {
     use std::collections::{HashMap, HashSet};
     let unique = |name: &str, taken: &HashSet<String>| {
         let base = format!("{name} ({label})");
@@ -295,12 +338,39 @@ fn disambiguate(next: &mut Kubeconfig, merged: &Kubeconfig, label: &str) {
                 ctx.user = Some(new.clone());
             }
         }
-        if let Some(old) = merged.contexts.iter().find(|m| m.name == c.name)
-            && !same(&old.context, &c.context)
-        {
-            let new = unique(&c.name, &taken);
+        let orig = c.name.clone();
+        if let Some(old_pos) = merged.contexts.iter().position(|m| m.name == orig) {
+            if !same(&merged.contexts[old_pos].context, &c.context) {
+                conflicted_names.insert(orig.clone());
+                // Rename the existing entry in `merged` using its own file label.
+                if let Some(idx) = merged_contexts.iter().position(|e| e.0 == orig) {
+                    let old_label = merged_contexts[idx].2.clone();
+                    let base = format!("{orig} ({old_label})");
+                    let mut old_new = base.clone();
+                    let mut n = 2;
+                    while taken.contains(&old_new) {
+                        old_new = format!("{base} {n}");
+                        n += 1;
+                    }
+                    taken.insert(old_new.clone());
+                    if merged.current_context.as_deref() == Some(orig.as_str()) {
+                        merged.current_context = Some(old_new.clone());
+                    }
+                    merged.contexts[old_pos].name = old_new.clone();
+                    merged_contexts[idx].0 = old_new;
+                }
+
+                let new = unique(&orig, &taken);
+                taken.insert(new.clone());
+                if next.current_context.as_deref() == Some(orig.as_str()) {
+                    next.current_context = Some(new.clone());
+                }
+                c.name = new;
+            }
+        } else if conflicted_names.contains(&orig) {
+            let new = unique(&orig, &taken);
             taken.insert(new.clone());
-            if next.current_context.as_deref() == Some(c.name.as_str()) {
+            if next.current_context.as_deref() == Some(orig.as_str()) {
                 next.current_context = Some(new.clone());
             }
             c.name = new;
@@ -406,9 +476,19 @@ mod tests {
     }
 
     fn merge(first: &str, next: &str, label: &str) -> Kubeconfig {
-        let merged = kc(first);
+        merge_with_labels(first, "k3s-a", next, label)
+    }
+
+    fn merge_with_labels(first: &str, first_label: &str, next: &str, next_label: &str) -> Kubeconfig {
+        let mut merged = kc(first);
+        let mut merged_contexts: Vec<(String, String, String, String)> = merged
+            .contexts
+            .iter()
+            .map(|c| (c.name.clone(), first_label.into(), first_label.into(), c.name.clone()))
+            .collect();
+        let mut conflicted = std::collections::HashSet::new();
         let mut next = kc(next);
-        disambiguate(&mut next, &merged, label);
+        disambiguate(&mut next, &mut merged, &mut merged_contexts, &mut conflicted, next_label);
         merged.merge(next).unwrap()
     }
 
@@ -422,12 +502,12 @@ mod tests {
     fn same_names_from_different_files_are_kept_apart() {
         let m = merge(&k3s("https://a:6443", "ta"), &k3s("https://b:6443", "tb"), "k3s-b");
         let names: Vec<_> = m.contexts.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["default", "default (k3s-b)"]);
-        assert_eq!(server_of(&m, "default"), "https://a:6443");
+        assert_eq!(names, ["default (k3s-a)", "default (k3s-b)"]);
+        assert_eq!(server_of(&m, "default (k3s-a)"), "https://a:6443");
         assert_eq!(server_of(&m, "default (k3s-b)"), "https://b:6443");
         let ctx = m.contexts[1].context.as_ref().unwrap();
         assert_eq!(ctx.user.as_deref(), Some("default (k3s-b)"));
-        assert_eq!(m.current_context.as_deref(), Some("default"));
+        assert_eq!(m.current_context.as_deref(), Some("default (k3s-a)"));
     }
 
     #[test]
@@ -450,12 +530,24 @@ mod tests {
 
     #[test]
     fn renamed_names_stay_unique() {
-        let first = merge(&k3s("https://a:6443", "ta"), &k3s("https://b:6443", "tb"), "lab");
+        let mut merged = kc(&k3s("https://a:6443", "ta"));
+        let mut merged_contexts = vec![(
+            "default".into(),
+            "k3s-a".into(),
+            "k3s-a".into(),
+            "default".into(),
+        )];
+        let mut conflicted = std::collections::HashSet::new();
+        let mut second = kc(&k3s("https://b:6443", "tb"));
+        disambiguate(&mut second, &mut merged, &mut merged_contexts, &mut conflicted, "lab");
+        merged_contexts.push(("default (lab)".into(), "lab".into(), "lab".into(), "default".into()));
+        merged = merged.merge(second).unwrap();
+
         let mut third = kc(&k3s("https://c:6443", "tc"));
-        disambiguate(&mut third, &first, "lab");
-        let m = first.merge(third).unwrap();
+        disambiguate(&mut third, &mut merged, &mut merged_contexts, &mut conflicted, "lab");
+        let m = merged.merge(third).unwrap();
         let names: Vec<_> = m.contexts.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["default", "default (lab)", "default (lab) 2"]);
+        assert_eq!(names, ["default (k3s-a)", "default (lab)", "default (lab) 2"]);
         assert_eq!(server_of(&m, "default (lab) 2"), "https://c:6443");
     }
 
@@ -463,5 +555,6 @@ mod tests {
     fn file_labels() {
         assert_eq!(file_label(Path::new("/home/me/.kube/k3s-lab.yaml")), "k3s-lab");
         assert_eq!(file_label(Path::new("/srv/lab/config")), "lab/config");
+        assert_eq!(file_label(Path::new("/home/me/.kube/config.bak")), ".kube/config.bak");
     }
 }

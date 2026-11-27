@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use ratatui::style::Color;
@@ -9,6 +10,80 @@ pub enum Env {
     Stage,
     Dev,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvChoice {
+    Auto,
+    Prod,
+    Stage,
+    Dev,
+    Local,
+    None,
+}
+
+impl EnvChoice {
+    pub const ALL: [EnvChoice; 6] = [
+        EnvChoice::Auto,
+        EnvChoice::Prod,
+        EnvChoice::Stage,
+        EnvChoice::Dev,
+        EnvChoice::Local,
+        EnvChoice::None,
+    ];
+
+    pub fn from_setting(s: &str) -> Option<Self> {
+        match s {
+            "prod" => Some(EnvChoice::Prod),
+            "stage" => Some(EnvChoice::Stage),
+            "dev" => Some(EnvChoice::Dev),
+            "local" => Some(EnvChoice::Local),
+            "none" => Some(EnvChoice::None),
+            "auto" => Some(EnvChoice::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_setting(self) -> Option<&'static str> {
+        match self {
+            EnvChoice::Auto => None,
+            EnvChoice::Prod => Some("prod"),
+            EnvChoice::Stage => Some("stage"),
+            EnvChoice::Dev => Some("dev"),
+            EnvChoice::Local => Some("local"),
+            EnvChoice::None => Some("none"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EnvChoice::Auto => "Auto (detect from context name)",
+            EnvChoice::Prod => "PROD (Production)",
+            EnvChoice::Stage => "STAGE (Staging)",
+            EnvChoice::Dev => "DEV (Development)",
+            EnvChoice::Local => "LOCAL (Local)",
+            EnvChoice::None => "None (unclassified)",
+        }
+    }
+
+    pub fn env(self) -> Option<Env> {
+        match self {
+            EnvChoice::Auto => None,
+            EnvChoice::Prod => Some(Env::Prod),
+            EnvChoice::Stage => Some(Env::Stage),
+            EnvChoice::Dev => Some(Env::Dev),
+            EnvChoice::Local => Some(Env::Local),
+            EnvChoice::None => None,
+        }
+    }
+}
+
+pub fn resolve_env(choices: &BTreeMap<String, String>, ctx: &str) -> Option<Env> {
+    match choices.get(ctx).and_then(|s| EnvChoice::from_setting(s)) {
+        Some(EnvChoice::None) => None,
+        Some(EnvChoice::Auto) | None => detect_env(ctx),
+        Some(choice) => choice.env(),
+    }
 }
 
 impl Env {
@@ -78,5 +153,20 @@ mod tests {
         assert_eq!(detect_env("api-staging"), Some(Env::Stage));
         assert_eq!(detect_env("team-dev"), Some(Env::Dev));
         assert_eq!(detect_env("my-cluster"), None);
+    }
+
+    #[test]
+    fn resolves_overrides_and_falls_back_to_detect() {
+        let mut choices = BTreeMap::new();
+        assert_eq!(resolve_env(&choices, "my-cluster"), None);
+        assert_eq!(resolve_env(&choices, "api-prod"), Some(Env::Prod));
+
+        choices.insert("my-cluster".into(), "prod".into());
+        choices.insert("api-prod".into(), "none".into());
+        assert_eq!(resolve_env(&choices, "my-cluster"), Some(Env::Prod));
+        assert_eq!(resolve_env(&choices, "api-prod"), None);
+
+        choices.insert("api-prod".into(), "dev".into());
+        assert_eq!(resolve_env(&choices, "api-prod"), Some(Env::Dev));
     }
 }

@@ -1,6 +1,7 @@
 mod app;
 mod core;
 mod env;
+mod interpret;
 mod k8s;
 mod ui;
 
@@ -11,7 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -72,7 +73,7 @@ fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         prev(info);
     }));
 }
@@ -80,7 +81,7 @@ fn install_panic_hook() {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = parse_args();
-    if let Some(kc) = cli.kubeconfig {
+    if let Some(kc) = cli.kubeconfig.as_deref() {
         // Safe before spawning background threads.
         unsafe { std::env::set_var("KUBECONFIG", kc) };
     }
@@ -94,16 +95,17 @@ async fn main() -> io::Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(state.clone(), tx.clone(), cli.context);
+    let mut app = App::new_with_cli(state.clone(), tx.clone(), cli.context, cli.kubeconfig);
 
     let res = run_loop(&mut terminal, &mut app, &mut rx).await;
+    app.save_view_state();
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
     res
@@ -119,6 +121,9 @@ async fn run_loop(
             app.handle_event(ev);
         }
 
+        if let Ok(sz) = terminal.size() {
+            app.term_size = (sz.width, sz.height);
+        }
         terminal.draw(|f| ui::render(f, app))?;
 
         if let Some(ext) = app.pending_external.take() {
@@ -131,15 +136,66 @@ async fn run_loop(
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == crossterm::event::KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                     app.handle_key(key);
                 }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
         }
         app.tick_count = app.tick_count.wrapping_add(1);
     }
     Ok(())
+}
+
+struct TempKubeconfig(Option<std::path::PathBuf>);
+
+impl Drop for TempKubeconfig {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Builds a `kubectl` command using the merged in-memory kubeconfig so disambiguated
+/// context names (e.g. `"internal-dev (.kube/config)"`) and scanned `~/.kube/` files work.
+fn kubectl_for_context(state: &AppState, context: &str) -> (Command, TempKubeconfig) {
+    let mut cmd = Command::new("kubectl");
+    let tmp = std::env::temp_dir().join(format!("steerglass-kubeconfig-{}.yaml", std::process::id()));
+    let written = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let kc = state.kubeconfig.read();
+        let yaml = serde_yaml::to_string(&*kc)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(yaml.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, yaml)?;
+        }
+        Ok(())
+    })();
+
+    let guard = if written.is_ok() {
+        cmd.arg("--kubeconfig").arg(&tmp);
+        TempKubeconfig(Some(tmp))
+    } else {
+        TempKubeconfig(None)
+    };
+    cmd.arg("--context").arg(context);
+    (cmd, guard)
 }
 
 async fn run_external(
@@ -148,7 +204,7 @@ async fn run_external(
     ext: PendingExternal,
 ) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     match ext {
@@ -158,10 +214,8 @@ async fn run_external(
             pod,
             container,
         } => {
-            let mut cmd = Command::new("kubectl");
-            cmd.arg("--context")
-                .arg(&context)
-                .arg("exec")
+            let (mut cmd, _kc_guard) = kubectl_for_context(&app.state, &context);
+            cmd.arg("exec")
                 .arg("-it")
                 .arg("-n")
                 .arg(&namespace)
@@ -178,6 +232,36 @@ async fn run_external(
                 Ok(status) if status.success() => {}
                 Ok(status) => app.set_toast(format!("Shell exited with {status}"), true),
                 Err(e) => app.set_toast(format!("Failed to launch kubectl: {e}"), true),
+            }
+        }
+        PendingExternal::Debug {
+            context,
+            namespace,
+            name,
+            is_node,
+            image,
+            target,
+        } => {
+            let (mut cmd, _kc_guard) = kubectl_for_context(&app.state, &context);
+            cmd.arg("debug");
+            if is_node {
+                cmd.arg(format!("node/{name}")).arg("-it");
+            } else {
+                cmd.arg("-it");
+                if let Some(ns) = &namespace {
+                    cmd.arg("-n").arg(ns);
+                }
+                cmd.arg(&name);
+                if let Some(t) = &target {
+                    cmd.arg(format!("--target={t}"));
+                }
+            }
+            cmd.arg(format!("--image={image}"));
+
+            match cmd.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => app.set_toast(format!("Debug exited with {status}"), true),
+                Err(e) => app.set_toast(format!("Failed to launch kubectl debug: {e}"), true),
             }
         }
         PendingExternal::EditYaml {
@@ -242,10 +326,50 @@ async fn run_external(
                 let _ = std::fs::remove_file(&tmp);
             }
         }
+        #[cfg(unix)]
+        PendingExternal::Suspend => {
+            // Raw mode, alternate screen, and cursor are already restored above;
+            // SIGTSTP pauses until `fg`, then the epilogue re-enters the TUI.
+            unsafe { libc::raise(libc::SIGTSTP) };
+        }
     }
 
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kubectl_for_context_writes_merged_kubeconfig_and_cleans_up() {
+        let dir = std::env::temp_dir().join("steerglass-tui-kubectl-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = AppState::new(dir.join("settings.json"));
+        {
+            let mut kc = state.kubeconfig.write();
+            kc.contexts.push(kube::config::NamedContext {
+                name: "internal-dev (.kube/config)".into(),
+                context: None,
+                ..Default::default()
+            });
+        }
+
+        let path;
+        {
+            let (cmd, guard) = kubectl_for_context(&state, "internal-dev (.kube/config)");
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert_eq!(args[0], "--kubeconfig");
+            assert_eq!(args[2], "--context");
+            assert_eq!(args[3], "internal-dev (.kube/config)");
+            path = guard.0.clone().expect("temp kubeconfig path");
+            let contents = std::fs::read_to_string(&path).expect("read temp kubeconfig");
+            assert!(contents.contains("internal-dev (.kube/config)"));
+        }
+        assert!(!path.exists(), "temp kubeconfig should be removed on drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
