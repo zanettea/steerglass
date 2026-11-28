@@ -284,6 +284,7 @@ pub fn decode_yaml_data_lines(raw: &[String]) -> Vec<String> {
                     }
                 }
             }
+
         }
         out.push(line.clone());
     }
@@ -393,6 +394,12 @@ pub enum ConfirmKind {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerPurpose {
+    Logs,
+    Shell,
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     None,
@@ -418,6 +425,17 @@ pub enum Modal {
         loading: bool,
         error: Option<String>,
     },
+    DescribeViewer {
+        context: String,
+        kind: KindRef,
+        namespace: Option<String>,
+        name: String,
+        lines: Vec<String>,
+        fullscreen: bool,
+        scroll: usize,
+        loading: bool,
+        error: Option<String>,
+    },
     LogsViewer {
         context: String,
         namespace: String,
@@ -429,6 +447,13 @@ pub enum Modal {
         scroll: usize,
         follow: bool,
         timestamps: bool,
+        wrap: bool,
+        filter_active: bool,
+        filter_text: String,
+        search_active: bool,
+        search_text: String,
+        search_match: Option<usize>,
+        container_picker: Option<usize>,
         generation: u64,
         error: Option<String>,
     },
@@ -447,6 +472,24 @@ pub enum Modal {
         context: String,
         selected: usize,
     },
+    ContainerPicker {
+        context: String,
+        namespace: String,
+        pod: String,
+        purpose: ContainerPurpose,
+        containers: Vec<String>,
+        selected: usize,
+        loading: bool,
+    },
+    ContainersView {
+        context: String,
+        namespace: String,
+        pod: String,
+        containers: Vec<k8s::PodContainerInfo>,
+        selected: usize,
+        loading: bool,
+        error: Option<String>,
+    },
     DebugPrompt {
         context: String,
         namespace: Option<String>,
@@ -454,8 +497,9 @@ pub enum Modal {
         is_node: bool,
         selected_preset: usize,
         custom_image: String,
-        target: String,
-        editing_target: bool,
+        containers: Vec<String>,
+        selected_target: usize,
+        focus_target: bool,
     },
     PortForwardPrompt {
         context: String,
@@ -481,6 +525,9 @@ pub enum PaletteItem {
     SetClusterEnv,
     ScanIssues,
     ReloadKubeconfig,
+    Describe,
+    Containers,
+    Debug,
 }
 
 impl PaletteItem {
@@ -499,6 +546,9 @@ impl PaletteItem {
             PaletteItem::SetClusterEnv => "Action: Change cluster environment".into(),
             PaletteItem::ScanIssues => "Action: Scan all resources for issues".into(),
             PaletteItem::ReloadKubeconfig => "Action: Reload kubeconfig".into(),
+            PaletteItem::Describe => "Action: Describe selected resource".into(),
+            PaletteItem::Containers => "Action: View pod containers".into(),
+            PaletteItem::Debug => "Action: Debug container (kubectl debug)".into(),
         }
     }
 }
@@ -1027,6 +1077,7 @@ impl App {
                     }
                 }
             }
+
         }
         kinds
     }
@@ -1063,6 +1114,7 @@ impl App {
                     }
                 }
             }
+
         }
         out.sort_by(|a, b| match self.utilization_sort {
             UtilizationSort::CpuDesc => b
@@ -1097,6 +1149,7 @@ impl App {
                     }
                 }
             }
+
         }
         out.sort_by(|a, b| match self.utilization_sort {
             UtilizationSort::CpuDesc => b
@@ -1126,6 +1179,9 @@ impl App {
         items.push(PaletteItem::SetClusterEnv);
         items.push(PaletteItem::ScanIssues);
         items.push(PaletteItem::ReloadKubeconfig);
+        items.push(PaletteItem::Describe);
+        items.push(PaletteItem::Containers);
+        items.push(PaletteItem::Debug);
 
         let q = query.trim().to_lowercase();
         if !q.is_empty() {
@@ -1201,6 +1257,7 @@ impl App {
                     }
                 }
             }
+
             AppEvent::IssuesLoaded { context, result } => {
                 if let Ok(list) = result {
                     self.issues_by_ctx.insert(context, list);
@@ -1309,18 +1366,88 @@ impl App {
                     }
                 }
             }
+            AppEvent::DescribeLoaded {
+                context,
+                name,
+                namespace,
+                kind,
+                result,
+            } => {
+                if let Modal::DescribeViewer {
+                    context: mc,
+                    name: mn,
+                    namespace: mns,
+                    kind: mk,
+                    lines,
+                    loading,
+                    error,
+                    ..
+                } = &mut self.modal
+                {
+                    if *mc == context && *mn == name && *mns == namespace && mk.kind == kind.kind {
+                        *loading = false;
+                        match result {
+                            Ok(text) => {
+                                *lines = text.lines().map(sanitize_log_line).collect();
+                                *error = None;
+                            }
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                }
+            }
             AppEvent::ContainersLoaded {
                 context,
                 namespace,
                 pod,
                 containers,
             } => {
+                let mut launch: Option<(ContainerPurpose, String, String, String, Option<String>, Vec<String>)> = None;
+                if let Modal::ContainerPicker {
+                    context: mc,
+                    namespace: mns,
+                    pod: mp,
+                    purpose,
+                    containers: mc_list,
+                    loading,
+                    ..
+                } = &mut self.modal
+                {
+                    if *mc == context && *mns == namespace && *mp == pod {
+                        if containers.len() <= 1 {
+                            let chosen = containers.first().cloned();
+                            launch = Some((*purpose, context.clone(), namespace.clone(), pod.clone(), chosen, containers.clone()));
+                        } else {
+                            *mc_list = containers.clone();
+                            *loading = false;
+                        }
+                    }
+                }
+                if let Some((purpose, ctx, ns, p, chosen, all)) = launch {
+                    self.launch_container_purpose(purpose, ctx, ns, p, chosen, all);
+                    return;
+                }
+                if let Modal::DebugPrompt {
+                    context: mc,
+                    namespace: Some(mns),
+                    name: mn,
+                    containers: mc_list,
+                    ..
+                } = &mut self.modal
+                {
+                    if *mc == context && *mns == namespace && *mn == pod {
+                        *mc_list = containers;
+                        return;
+                    }
+                }
+                let mut need_restart = false;
                 if let Modal::LogsViewer {
                     context: mc,
                     namespace: mns,
                     pod: mp,
                     containers: mc_list,
                     container,
+                    error,
                     ..
                 } = &mut self.modal
                 {
@@ -1328,6 +1455,41 @@ impl App {
                         *mc_list = containers;
                         if container.is_none() {
                             *container = mc_list.first().cloned();
+                            if mc_list.len() > 1 || error.is_some() {
+                                *error = None;
+                                need_restart = true;
+                            }
+                        }
+                    }
+                }
+                if need_restart {
+                    self.restart_logs_stream();
+                }
+            }
+            AppEvent::PodContainersLoaded {
+                context,
+                namespace,
+                pod,
+                result,
+            } => {
+                if let Modal::ContainersView {
+                    context: mc,
+                    namespace: mns,
+                    pod: mp,
+                    containers,
+                    loading,
+                    error,
+                    ..
+                } = &mut self.modal
+                {
+                    if *mc == context && *mns == namespace && *mp == pod {
+                        *loading = false;
+                        match result {
+                            Ok(list) => {
+                                *containers = list;
+                                *error = None;
+                            }
+                            Err(e) => *error = Some(e),
                         }
                     }
                 }
@@ -1342,7 +1504,7 @@ impl App {
                 } = &mut self.modal
                 {
                     if *mg == generation {
-                        lines.push(line);
+                        lines.push(sanitize_log_line(&line));
                         if lines.len() > 5000 {
                             lines.drain(..lines.len() - 5000);
                         }
@@ -1352,6 +1514,7 @@ impl App {
                     }
                 }
             }
+
             AppEvent::LogError { generation, message } => {
                 if let Modal::LogsViewer {
                     generation: mg,
@@ -1364,6 +1527,7 @@ impl App {
                     }
                 }
             }
+
             AppEvent::ActionDone { message, refresh_yaml } => match message {
                 Ok(msg) => {
                     self.set_toast(msg, false);
@@ -1440,6 +1604,7 @@ impl App {
                     }
                 }
             }
+
             MouseEventKind::Drag(MouseButton::Left) => match self.dragging {
                 Some(DragTarget::Sidebar) => {
                     self.sidebar_width = mouse.column.saturating_add(1).clamp(16, max_sidebar);
@@ -1654,7 +1819,8 @@ impl App {
                         self.utilization_pod_cursor += 1;
                     }
                 }
-            },
+            }
+,
             KeyCode::Char('g') => match self.utilization_pane {
                 UtilizationPane::Nodes => self.utilization_node_cursor = 0,
                 UtilizationPane::Pods => self.utilization_pod_cursor = 0,
@@ -1679,6 +1845,7 @@ impl App {
                     }
                 }
             }
+
             _ => {}
         }
     }
@@ -1721,6 +1888,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('e') => {
                 if self.sidebar_cursor > 0 {
                     if let Some(ctx) = self.contexts.get(self.sidebar_cursor - 1).map(|c| c.name.clone()) {
@@ -1728,6 +1896,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Right | KeyCode::Char('l') => {
                 self.focus = Focus::Main;
             }
@@ -1774,7 +1943,8 @@ impl App {
                         self.overview_issue_cursor += 1;
                     }
                 }
-            },
+            }
+,
             KeyCode::Char('K') => {
                 if self.overview_pane == OverviewPane::Clusters {
                     self.move_overview_context(-1);
@@ -1811,7 +1981,8 @@ impl App {
                         self.open_single_cluster(ctx);
                     }
                 }
-            },
+            }
+,
             KeyCode::Char(' ') | KeyCode::Char('m') => {
                 if self.overview_pane == OverviewPane::Clusters {
                     if let Some(ctx) = self.contexts.get(self.overview_cluster_cursor).map(|c| c.name.clone()) {
@@ -1819,6 +1990,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('e') => {
                 if self.overview_pane == OverviewPane::Clusters {
                     if let Some(ctx) = self.contexts.get(self.overview_cluster_cursor).map(|c| c.name.clone()) {
@@ -1826,6 +1998,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('s') => {
                 if !self.scan_running {
                     if let Some(ctx) = self.contexts.get(self.overview_cluster_cursor).map(|c| c.name.clone()) {
@@ -1835,6 +2008,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('r') => {
                 self.probe_all_overview();
                 self.set_toast("Refreshing overview...", false);
@@ -1920,6 +2094,11 @@ impl App {
                     self.open_yaml_viewer(tr.context.clone(), tr.row.namespace.clone(), tr.row.name.clone(), YamlViewMode::Raw);
                 }
             }
+            KeyCode::Char('d') => {
+                if let Some(tr) = rows.get(self.table_cursor) {
+                    self.open_describe_viewer(tr.context.clone(), tr.row.namespace.clone(), tr.row.name.clone());
+                }
+            }
             KeyCode::Char('x') => {
                 if let Some(tr) = rows.get(self.table_cursor) {
                     self.open_yaml_viewer(tr.context.clone(), tr.row.namespace.clone(), tr.row.name.clone(), YamlViewMode::Decoded);
@@ -1934,7 +2113,7 @@ impl App {
                 if self.active_kind.kind == "Pod" {
                     if let Some(tr) = rows.get(self.table_cursor) {
                         if let Some(ns) = tr.row.namespace.clone() {
-                            self.open_logs_viewer(tr.context.clone(), ns, tr.row.name.clone());
+                            self.open_container_picker(tr.context.clone(), ns, tr.row.name.clone(), ContainerPurpose::Logs);
                         }
                     }
                 } else {
@@ -1945,46 +2124,23 @@ impl App {
                 if self.active_kind.kind == "Pod" {
                     if let Some(tr) = rows.get(self.table_cursor) {
                         if let Some(ns) = tr.row.namespace.clone() {
-                            self.pending_external = Some(PendingExternal::Shell {
-                                context: tr.context.clone(),
-                                namespace: ns,
-                                pod: tr.row.name.clone(),
-                                container: None,
-                            });
+                            self.open_container_picker(tr.context.clone(), ns, tr.row.name.clone(), ContainerPurpose::Shell);
                         }
                     }
                 } else {
                     self.set_toast("Shell is available for Pods", true);
                 }
             }
-            KeyCode::Char('D') => {
+            KeyCode::Char('X') => {
                 if self.active_kind.kind == "Pod" {
                     if let Some(tr) = rows.get(self.table_cursor) {
                         if let Some(ns) = tr.row.namespace.clone() {
-                            self.modal = Modal::DebugPrompt {
-                                context: tr.context.clone(),
-                                namespace: Some(ns),
-                                name: tr.row.name.clone(),
-                                is_node: false,
-                                selected_preset: 0,
-                                custom_image: String::new(),
-                                target: String::new(),
-                                editing_target: false,
-                            };
+                            self.open_debug_prompt(tr.context.clone(), Some(ns), tr.row.name.clone(), false);
                         }
                     }
                 } else if self.active_kind.kind == "Node" {
                     if let Some(tr) = rows.get(self.table_cursor) {
-                        self.modal = Modal::DebugPrompt {
-                            context: tr.context.clone(),
-                            namespace: None,
-                            name: tr.row.name.clone(),
-                            is_node: true,
-                            selected_preset: 0,
-                            custom_image: String::new(),
-                            target: String::new(),
-                            editing_target: false,
-                        };
+                        self.open_debug_prompt(tr.context.clone(), None, tr.row.name.clone(), true);
                     }
                 } else {
                     self.set_toast("Debug container is available for Pods and Nodes", true);
@@ -2045,7 +2201,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete => {
+            KeyCode::Char('D') | KeyCode::Delete => {
                 if let Some(tr) = rows.get(self.table_cursor) {
                     let is_prod = self.context_env(&tr.context) == Some(Env::Prod);
                     self.modal = Modal::Confirm {
@@ -2078,6 +2234,7 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('S') => {
                 if matches!(
                     self.active_kind.kind.as_str(),
@@ -2094,8 +2251,15 @@ impl App {
                     }
                 }
             }
+
             KeyCode::Char('c') => {
-                if self.active_kind.kind == "Node" {
+                if self.active_kind.kind == "Pod" {
+                    if let Some(tr) = rows.get(self.table_cursor) {
+                        if let Some(ns) = tr.row.namespace.clone() {
+                            self.open_containers_view(tr.context.clone(), ns, tr.row.name.clone());
+                        }
+                    }
+                } else if self.active_kind.kind == "Node" {
                     if let Some(tr) = rows.get(self.table_cursor) {
                         let cordoned = tr
                             .row
@@ -2113,6 +2277,18 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('C') => {
+                if self.active_kind.kind == "Pod" {
+                    if let Some(tr) = rows.get(self.table_cursor) {
+                        if let Some(ns) = tr.row.namespace.clone() {
+                            self.open_containers_view(tr.context.clone(), ns, tr.row.name.clone());
+                        }
+                    }
+                } else {
+                    self.set_toast("Containers view is available for Pods", true);
+                }
+            }
+
             KeyCode::Char('p') => {
                 if self.active_kind.kind == "CronJob" {
                     if let Some(tr) = rows.get(self.table_cursor) {
@@ -2131,6 +2307,7 @@ impl App {
                     }
                 }
             }
+
             _ => {}
         }
     }
@@ -2171,6 +2348,157 @@ impl App {
         k8s::spawn_yaml(self.state.clone(), context, kind, namespace, name, self.tx.clone());
     }
 
+    fn open_describe_viewer(
+        &mut self,
+        context: String,
+        namespace: Option<String>,
+        name: String,
+    ) {
+        let kind = self.active_kind.clone();
+        self.modal = Modal::DescribeViewer {
+            context: context.clone(),
+            kind: kind.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            lines: Vec::new(),
+            fullscreen: false,
+            scroll: 0,
+            loading: true,
+            error: None,
+        };
+        k8s::spawn_describe(self.state.clone(), context, kind, namespace, name, self.tx.clone());
+    }
+
+    fn open_debug_prompt(
+        &mut self,
+        context: String,
+        namespace: Option<String>,
+        name: String,
+        is_node: bool,
+    ) {
+        self.modal = Modal::DebugPrompt {
+            context: context.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            is_node,
+            selected_preset: 0,
+            custom_image: String::new(),
+            containers: Vec::new(),
+            selected_target: 0,
+            focus_target: false,
+        };
+        if !is_node {
+            if let Some(ns) = namespace {
+                k8s::spawn_containers(self.state.clone(), context, ns, name, self.tx.clone());
+            }
+        }
+    }
+
+    fn open_containers_view(&mut self, context: String, namespace: String, pod: String) {
+        self.modal = Modal::ContainersView {
+            context: context.clone(),
+            namespace: namespace.clone(),
+            pod: pod.clone(),
+            containers: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+        };
+        k8s::spawn_pod_containers(self.state.clone(), context, namespace, pod, self.tx.clone());
+    }
+
+    fn open_container_picker(
+        &mut self,
+        context: String,
+        namespace: String,
+        pod: String,
+        purpose: ContainerPurpose,
+    ) {
+        self.modal = Modal::ContainerPicker {
+            context: context.clone(),
+            namespace: namespace.clone(),
+            pod: pod.clone(),
+            purpose,
+            containers: Vec::new(),
+            selected: 0,
+            loading: true,
+        };
+        k8s::spawn_containers(self.state.clone(), context, namespace, pod, self.tx.clone());
+    }
+
+    fn launch_container_purpose(
+        &mut self,
+        purpose: ContainerPurpose,
+        context: String,
+        namespace: String,
+        pod: String,
+        container: Option<String>,
+        containers: Vec<String>,
+    ) {
+        match purpose {
+            ContainerPurpose::Logs => {
+                self.open_logs_viewer_with_containers(context, namespace, pod, container, containers);
+            }
+            ContainerPurpose::Shell => {
+                self.modal = Modal::None;
+                self.pending_external = Some(PendingExternal::Shell {
+                    context,
+                    namespace,
+                    pod,
+                    container,
+                });
+            }
+        }
+    }
+
+    fn open_logs_viewer_with_containers(
+        &mut self,
+        context: String,
+        namespace: String,
+        pod: String,
+        container: Option<String>,
+        containers: Vec<String>,
+    ) {
+        if let Some(h) = self.log_handle.take() {
+            h.abort();
+        }
+        self.log_gen += 1;
+        let generation = self.log_gen;
+        self.modal = Modal::LogsViewer {
+            context: context.clone(),
+            namespace: namespace.clone(),
+            pod: pod.clone(),
+            container: container.clone(),
+            containers,
+            lines: Vec::new(),
+            fullscreen: false,
+            scroll: 0,
+            follow: true,
+            timestamps: false,
+            wrap: false,
+            filter_active: false,
+            filter_text: String::new(),
+            search_active: false,
+            search_text: String::new(),
+            search_match: None,
+            container_picker: None,
+            generation,
+            error: None,
+        };
+        self.log_handle = Some(k8s::spawn_logs(
+            self.state.clone(),
+            generation,
+            context,
+            namespace,
+            pod,
+            container,
+            true,
+            false,
+            self.tx.clone(),
+        ));
+    }
+
+    #[allow(dead_code)]
     fn open_logs_viewer(&mut self, context: String, namespace: String, pod: String) {
         if let Some(h) = self.log_handle.take() {
             h.abort();
@@ -2188,6 +2516,13 @@ impl App {
             scroll: 0,
             follow: true,
             timestamps: false,
+            wrap: false,
+            filter_active: false,
+            filter_text: String::new(),
+            search_active: false,
+            search_text: String::new(),
+            search_match: None,
+            container_picker: None,
             generation,
             error: None,
         };
@@ -2323,6 +2658,62 @@ impl App {
                                 self.probe_all_overview();
                                 self.set_toast("Reloaded kubeconfig", false);
                             }
+                            PaletteItem::Describe => {
+                                let rows = self.filtered_rows();
+                                if let Some(tr) = rows.get(self.table_cursor) {
+                                    self.open_describe_viewer(
+                                        tr.context.clone(),
+                                        tr.row.namespace.clone(),
+                                        tr.row.name.clone(),
+                                    );
+                                } else {
+                                    self.set_toast("No resource selected to describe", true);
+                                }
+                            }
+                            PaletteItem::Containers => {
+                                if self.active_kind.kind == "Pod" {
+                                    let rows = self.filtered_rows();
+                                    if let Some(tr) = rows.get(self.table_cursor) {
+                                        if let Some(ns) = tr.row.namespace.clone() {
+                                            self.open_containers_view(
+                                                tr.context.clone(),
+                                                ns,
+                                                tr.row.name.clone(),
+                                            );
+                                        }
+                                    } else {
+                                        self.set_toast("No pod selected", true);
+                                    }
+                                } else {
+                                    self.set_toast("Containers view is available for Pods", true);
+                                }
+                            }
+                            PaletteItem::Debug => {
+                                let rows = self.filtered_rows();
+                                if self.active_kind.kind == "Pod" {
+                                    if let Some(tr) = rows.get(self.table_cursor) {
+                                        if let Some(ns) = tr.row.namespace.clone() {
+                                            self.open_debug_prompt(
+                                                tr.context.clone(),
+                                                Some(ns),
+                                                tr.row.name.clone(),
+                                                false,
+                                            );
+                                        }
+                                    }
+                                } else if self.active_kind.kind == "Node" {
+                                    if let Some(tr) = rows.get(self.table_cursor) {
+                                        self.open_debug_prompt(
+                                            tr.context.clone(),
+                                            None,
+                                            tr.row.name.clone(),
+                                            true,
+                                        );
+                                    }
+                                } else {
+                                    self.set_toast("Debug container is available for Pods and Nodes", true);
+                                }
+                            }
                         }
                     } else {
                         self.modal = Modal::None;
@@ -2360,6 +2751,44 @@ impl App {
                         self.modal = Modal::None;
                         self.restart_watch();
                     }
+                }
+                _ => {}
+            },
+            Modal::DescribeViewer {
+                kind,
+                name,
+                lines,
+                fullscreen,
+                scroll,
+                ..
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *scroll + 1 < lines.len() {
+                        *scroll += 1;
+                    }
+                }
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
+                KeyCode::PageDown => {
+                    if !lines.is_empty() {
+                        *scroll = (*scroll + 20).min(lines.len() - 1);
+                    }
+                }
+                KeyCode::Char('g') => *scroll = 0,
+                KeyCode::Char('G') => {
+                    if !lines.is_empty() {
+                        *scroll = lines.len() - 1;
+                    }
+                }
+                KeyCode::Char('z') => {
+                    *fullscreen = !*fullscreen;
+                }
+                KeyCode::Char('c') => {
+                    let text = lines.join("\n");
+                    let msg = format!("Copied {} {} describe output", kind.kind, name);
+                    copy_to_clipboard(&text);
+                    self.set_toast(msg, false);
                 }
                 _ => {}
             },
@@ -2443,25 +2872,151 @@ impl App {
                 scroll,
                 follow,
                 timestamps,
+                wrap,
+                filter_active,
+                filter_text,
+                search_active,
+                search_text,
+                search_match,
+                container_picker,
                 container,
                 containers,
                 ..
             } => {
+                if let Some(sel) = container_picker {
+                    let mut need_restart = false;
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('c') => {
+                            *container_picker = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            *sel = sel.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if *sel + 1 < containers.len() {
+                                *sel += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(chosen) = containers.get(*sel).cloned() {
+                                *container = Some(chosen);
+                                need_restart = true;
+                            }
+                            *container_picker = None;
+                        }
+                        KeyCode::Char(ch) if ('1'..='9').contains(&ch) => {
+                            let idx = (ch as usize) - ('1' as usize);
+                            if let Some(chosen) = containers.get(idx).cloned() {
+                                *container = Some(chosen);
+                                *container_picker = None;
+                                need_restart = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if need_restart {
+                        self.restart_logs_stream();
+                    }
+                    return;
+                }
+                if *filter_active {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            *filter_active = false;
+                        }
+                        KeyCode::Backspace => {
+                            filter_text.pop();
+                            *search_match = None;
+                            if !*follow {
+                                *scroll = 0;
+                            }
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                            filter_text.push(ch);
+                            *search_match = None;
+                            if !*follow {
+                                *scroll = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if *search_active {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            *search_active = false;
+                        }
+                        KeyCode::Backspace => {
+                            search_text.pop();
+                            jump_log_search(lines, filter_text, search_text, *scroll, true, search_match, scroll, follow);
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                            search_text.push(ch);
+                            jump_log_search(lines, filter_text, search_text, *scroll, true, search_match, scroll, follow);
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                let visible_len = if filter_text.trim().is_empty() {
+                    lines.len()
+                } else {
+                    let q = filter_text.trim().to_lowercase();
+                    lines.iter().filter(|l| l.to_lowercase().contains(&q)).count()
+                };
                 let mut need_restart = false;
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc => {
+                        if !search_text.is_empty() {
+                            search_text.clear();
+                            *search_match = None;
+                            return;
+                        }
+                        if !filter_text.is_empty() {
+                            filter_text.clear();
+                            *search_match = None;
+                            if !*follow {
+                                *scroll = 0;
+                            }
+                            return;
+                        }
                         if let Some(h) = self.log_handle.take() {
                             h.abort();
                         }
                         self.modal = Modal::None;
                         return;
                     }
+                    KeyCode::Char('q') => {
+                        if let Some(h) = self.log_handle.take() {
+                            h.abort();
+                        }
+                        self.modal = Modal::None;
+                        return;
+                    }
+                    KeyCode::Char('/') => {
+                        *filter_active = true;
+                    }
+                    KeyCode::Char('s') => {
+                        *search_active = true;
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        *search_active = true;
+                    }
+                    KeyCode::Char('n') if !search_text.trim().is_empty() => {
+                        let from = search_match.map(|i| i + 1).unwrap_or(*scroll);
+                        jump_log_search(lines, filter_text, search_text, from, true, search_match, scroll, follow);
+                    }
+                    KeyCode::Char('N') if !search_text.trim().is_empty() => {
+                        let from = search_match.unwrap_or(*scroll);
+                        jump_log_search(lines, filter_text, search_text, from, false, search_match, scroll, follow);
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         *follow = false;
                         *scroll = scroll.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if *scroll + 1 < lines.len() {
+                        if *scroll + 1 < visible_len {
                             *scroll += 1;
                         }
                     }
@@ -2470,8 +3025,8 @@ impl App {
                         *scroll = scroll.saturating_sub(20);
                     }
                     KeyCode::PageDown => {
-                        if !lines.is_empty() {
-                            *scroll = (*scroll + 20).min(lines.len() - 1);
+                        if visible_len > 0 {
+                            *scroll = (*scroll + 20).min(visible_len - 1);
                         }
                     }
                     KeyCode::Char('g') => {
@@ -2480,12 +3035,12 @@ impl App {
                     }
                     KeyCode::Char('G') => {
                         *follow = true;
-                        *scroll = lines.len().saturating_sub(1);
+                        *scroll = visible_len.saturating_sub(1);
                     }
                     KeyCode::Char('f') => {
                         *follow = !*follow;
                         if *follow {
-                            *scroll = lines.len().saturating_sub(1);
+                            *scroll = visible_len.saturating_sub(1);
                         }
                     }
                     KeyCode::Char('z') => {
@@ -2495,15 +3050,16 @@ impl App {
                         *timestamps = !*timestamps;
                         need_restart = true;
                     }
+                    KeyCode::Char('w') => {
+                        *wrap = !*wrap;
+                    }
                     KeyCode::Char('c') => {
                         if containers.len() > 1 {
                             let idx = container
                                 .as_ref()
                                 .and_then(|c| containers.iter().position(|x| x == c))
-                                .map(|i| (i + 1) % containers.len())
                                 .unwrap_or(0);
-                            *container = Some(containers[idx].clone());
-                            need_restart = true;
+                            *container_picker = Some(idx);
                         }
                     }
                     _ => {}
@@ -2580,6 +3136,153 @@ impl App {
                 }
                 _ => {}
             },
+            Modal::ContainerPicker {
+                context,
+                namespace,
+                pod,
+                purpose,
+                containers,
+                selected,
+                loading,
+            } => {
+                let mut launch: Option<(ContainerPurpose, String, String, String, Option<String>, Vec<String>)> = None;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = Modal::None;
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !*loading && !containers.is_empty() => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !*loading && !containers.is_empty() => {
+                        if *selected + 1 < containers.len() {
+                            *selected += 1;
+                        }
+                    }
+                    KeyCode::Enter if !*loading && !containers.is_empty() => {
+                        if let Some(chosen) = containers.get(*selected).cloned() {
+                            launch = Some((
+                                *purpose,
+                                context.clone(),
+                                namespace.clone(),
+                                pod.clone(),
+                                Some(chosen),
+                                containers.clone(),
+                            ));
+                        }
+                    }
+                    KeyCode::Char(ch) if !*loading && ('1'..='9').contains(&ch) => {
+                        let idx = (ch as usize) - ('1' as usize);
+                        if let Some(chosen) = containers.get(idx).cloned() {
+                            launch = Some((
+                                *purpose,
+                                context.clone(),
+                                namespace.clone(),
+                                pod.clone(),
+                                Some(chosen),
+                                containers.clone(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((p, ctx, ns, pod_name, chosen, all)) = launch {
+                    self.launch_container_purpose(p, ctx, ns, pod_name, chosen, all);
+                }
+            }
+            Modal::ContainersView {
+                context,
+                namespace,
+                pod,
+                containers,
+                selected,
+                loading,
+                ..
+            } => {
+                let mut open_logs: Option<(String, String, String, String, Vec<String>)> = None;
+                let mut open_shell: Option<(String, String, String, String)> = None;
+                let mut open_debug: Option<(String, String, String, Vec<String>, usize)> = None;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = Modal::None;
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !*loading && !containers.is_empty() => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !*loading && !containers.is_empty() => {
+                        if *selected + 1 < containers.len() {
+                            *selected += 1;
+                        }
+                    }
+                    KeyCode::Char('l') | KeyCode::Enter if !*loading && !containers.is_empty() => {
+                        if let Some(c) = containers.get(*selected) {
+                            let all_names = containers.iter().map(|x| x.name.clone()).collect();
+                            open_logs = Some((
+                                context.clone(),
+                                namespace.clone(),
+                                pod.clone(),
+                                c.name.clone(),
+                                all_names,
+                            ));
+                        }
+                    }
+                    KeyCode::Char('s') if !*loading && !containers.is_empty() => {
+                        if let Some(c) = containers.get(*selected) {
+                            open_shell = Some((
+                                context.clone(),
+                                namespace.clone(),
+                                pod.clone(),
+                                c.name.clone(),
+                            ));
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('X') if !*loading && !containers.is_empty() => {
+                        let all_names = containers.iter().map(|x| x.name.clone()).collect();
+                        open_debug = Some((
+                            context.clone(),
+                            namespace.clone(),
+                            pod.clone(),
+                            all_names,
+                            *selected + 1,
+                        ));
+                    }
+                    KeyCode::Char('r') => {
+                        *loading = true;
+                        k8s::spawn_pod_containers(
+                            self.state.clone(),
+                            context.clone(),
+                            namespace.clone(),
+                            pod.clone(),
+                            self.tx.clone(),
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some((ctx, ns, p, chosen, all)) = open_logs {
+                    self.open_logs_viewer_with_containers(ctx, ns, p, Some(chosen), all);
+                } else if let Some((ctx, ns, p, chosen)) = open_shell {
+                    self.modal = Modal::None;
+                    self.pending_external = Some(PendingExternal::Shell {
+                        context: ctx,
+                        namespace: ns,
+                        pod: p,
+                        container: Some(chosen),
+                    });
+                } else if let Some((ctx, ns, p, all, target_idx)) = open_debug {
+                    self.modal = Modal::DebugPrompt {
+                        context: ctx,
+                        namespace: Some(ns),
+                        name: p,
+                        is_node: false,
+                        selected_preset: 0,
+                        custom_image: String::new(),
+                        containers: all,
+                        selected_target: target_idx,
+                        focus_target: false,
+                    };
+                }
+            }
             Modal::DebugPrompt {
                 context,
                 namespace,
@@ -2587,32 +3290,49 @@ impl App {
                 is_node,
                 selected_preset,
                 custom_image,
-                target,
-                editing_target,
+                containers,
+                selected_target,
+                focus_target,
             } => match key.code {
                 KeyCode::Esc => self.modal = Modal::None,
-                KeyCode::Tab if !*is_node => *editing_target = !*editing_target,
-                KeyCode::Up if !*editing_target => {
-                    *selected_preset = selected_preset.saturating_sub(1);
+                KeyCode::Tab if !*is_node => *focus_target = !*focus_target,
+                KeyCode::Up => {
+                    if *focus_target {
+                        *selected_target = selected_target.saturating_sub(1);
+                    } else {
+                        *selected_preset = selected_preset.saturating_sub(1);
+                    }
                 }
-                KeyCode::Down if !*editing_target => {
-                    if *selected_preset < DEBUG_IMAGES.len() {
+                KeyCode::Down => {
+                    if *focus_target {
+                        if *selected_target < containers.len() {
+                            *selected_target += 1;
+                        }
+                    } else if *selected_preset < DEBUG_IMAGES.len() {
                         *selected_preset += 1;
                     }
                 }
-                KeyCode::Backspace => {
-                    if *editing_target {
-                        target.pop();
-                    } else if *selected_preset == DEBUG_IMAGES.len() {
-                        custom_image.pop();
+                KeyCode::Char('k') if *focus_target || *selected_preset < DEBUG_IMAGES.len() => {
+                    if *focus_target {
+                        *selected_target = selected_target.saturating_sub(1);
+                    } else {
+                        *selected_preset = selected_preset.saturating_sub(1);
                     }
                 }
-                KeyCode::Char(ch) => {
-                    if *editing_target {
-                        target.push(ch);
-                    } else if *selected_preset == DEBUG_IMAGES.len() {
-                        custom_image.push(ch);
+                KeyCode::Char('j') if *focus_target || *selected_preset < DEBUG_IMAGES.len() => {
+                    if *focus_target {
+                        if *selected_target < containers.len() {
+                            *selected_target += 1;
+                        }
+                    } else if *selected_preset < DEBUG_IMAGES.len() {
+                        *selected_preset += 1;
                     }
+                }
+                KeyCode::Backspace if !*focus_target && *selected_preset == DEBUG_IMAGES.len() => {
+                    custom_image.pop();
+                }
+                KeyCode::Char(ch) if !*focus_target && *selected_preset == DEBUG_IMAGES.len() => {
+                    custom_image.push(ch);
                 }
                 KeyCode::Enter => {
                     let image = DEBUG_IMAGES
@@ -2622,8 +3342,8 @@ impl App {
                     if image.is_empty() {
                         return;
                     }
-                    let tgt = if !*is_node && !target.trim().is_empty() {
-                        Some(target.trim().to_string())
+                    let tgt = if !*is_node && *selected_target > 0 {
+                        containers.get(*selected_target - 1).cloned()
                     } else {
                         None
                     };
@@ -2762,6 +3482,90 @@ impl App {
             ),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jump_log_search(
+    lines: &[String],
+    filter_text: &str,
+    search_text: &str,
+    from: usize,
+    forward: bool,
+    search_match: &mut Option<usize>,
+    scroll: &mut usize,
+    follow: &mut bool,
+) {
+    let sq = search_text.trim().to_lowercase();
+    if sq.is_empty() {
+        *search_match = None;
+        return;
+    }
+    let fq = filter_text.trim().to_lowercase();
+    let matches: Vec<usize> = lines
+        .iter()
+        .filter(|l| fq.is_empty() || l.to_lowercase().contains(&fq))
+        .enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(&sq))
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        *search_match = None;
+        return;
+    }
+    let target = if forward {
+        matches.iter().copied().find(|&i| i >= from).unwrap_or(matches[0])
+    } else {
+        matches
+            .iter()
+            .copied()
+            .rfind(|&i| i < from)
+            .unwrap_or(*matches.last().unwrap())
+    };
+    *search_match = Some(target);
+    *follow = false;
+    *scroll = target;
+}
+
+/// Strips ANSI escape sequences and control characters, and expands tabs so raw pod log
+/// lines cannot move the terminal cursor or leave stale characters behind in ratatui.
+fn sanitize_log_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c == '\t' {
+            out.push_str("    ");
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3062,7 +3866,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("1".into(), sample_row("1", "web", "default", Health::Ok, vec![]));
         app.rows_by_ctx.insert("my-cluster".into(), map);
-        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
         assert!(matches!(
             app.modal,
             Modal::Confirm {
@@ -3093,8 +3897,8 @@ mod tests {
         map.insert("1".into(), sample_row("1", "api-0", "app", Health::Ok, vec![]));
         app.rows_by_ctx.insert("dev-ctx".into(), map);
 
-        // Pod: Shift+D opens DebugPrompt, select netshoot (index 1), Tab to target, type "api", Enter.
-        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
+        // Pod: Shift+X opens DebugPrompt, select netshoot (index 1), Tab to target, select "api", Enter.
+        app.handle_key(KeyEvent::from(KeyCode::Char('X')));
         assert!(matches!(
             app.modal,
             Modal::DebugPrompt {
@@ -3104,11 +3908,15 @@ mod tests {
                 ..
             } if name == "api-0"
         ));
+        app.handle_event(AppEvent::ContainersLoaded {
+            context: "dev-ctx".into(),
+            namespace: "app".into(),
+            pod: "api-0".into(),
+            containers: vec!["api".into(), "sidecar".into()],
+        });
         app.handle_key(KeyEvent::from(KeyCode::Down));
         app.handle_key(KeyEvent::from(KeyCode::Tab));
-        for ch in "api".chars() {
-            app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
-        }
+        app.handle_key(KeyEvent::from(KeyCode::Down));
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.modal, Modal::None));
         assert!(matches!(
@@ -3123,7 +3931,7 @@ mod tests {
             }) if context == "dev-ctx" && ns == "app" && name == "api-0" && image == "nicolaka/netshoot:latest" && tgt == "api"
         ));
 
-        // Node: Shift+D opens DebugPrompt with is_node = true, choose custom image.
+        // Node: Shift+X opens DebugPrompt with is_node = true, choose custom image.
         app.pending_external = None;
         app.active_kind = KindRef {
             group: String::new(),
@@ -3139,7 +3947,7 @@ mod tests {
         node_map.insert("n1".into(), node_row);
         app.rows_by_ctx.insert("dev-ctx".into(), node_map);
 
-        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('X')));
         for _ in 0..DEBUG_IMAGES.len() {
             app.handle_key(KeyEvent::from(KeyCode::Down));
         }
@@ -3630,6 +4438,405 @@ mod tests {
                 ref name,
                 ..
             } if kind == "Pod" && name == "web-0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn logs_viewer_w_toggles_wrap_and_sanitizes_control_chars() {
+        let mut app = test_app();
+        app.modal = Modal::LogsViewer {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "web-0".into(),
+            container: None,
+            containers: vec![],
+            lines: vec![],
+            fullscreen: false,
+            scroll: 0,
+            follow: true,
+            timestamps: false,
+            wrap: false,
+            filter_active: false,
+            filter_text: String::new(),
+            search_active: false,
+            search_text: String::new(),
+            search_match: None,
+            container_picker: None,
+            generation: 1,
+            error: None,
+        };
+
+        app.handle_event(AppEvent::LogLine {
+            generation: 1,
+            line: "\x1b[32mINFO\x1b[0m\thello\r\x1b]0;title\x07world".into(),
+        });
+        if let Modal::LogsViewer { ref lines, wrap, .. } = app.modal {
+            assert!(!wrap);
+            assert_eq!(lines, &["INFO    helloworld"]);
+        } else {
+            panic!("expected LogsViewer");
+        }
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(matches!(app.modal, Modal::LogsViewer { wrap: true, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(matches!(app.modal, Modal::LogsViewer { wrap: false, .. }));
+
+        // Filtering with '/'
+        app.handle_event(AppEvent::LogLine {
+            generation: 1,
+            line: "WARN something else".into(),
+        });
+        app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        assert!(matches!(app.modal, Modal::LogsViewer { filter_active: true, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        if let Modal::LogsViewer {
+            filter_active,
+            ref filter_text,
+            wrap,
+            ..
+        } = app.modal
+        {
+            assert!(!filter_active);
+            assert_eq!(filter_text, "warn");
+            // Typing 'w' while filter_active must not toggle wrap.
+            assert!(!wrap);
+        } else {
+            panic!("expected LogsViewer");
+        }
+        // First Esc clears filter_text; second Esc closes LogsViewer.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::LogsViewer { ref filter_text, .. } if filter_text.is_empty()));
+
+        // Searching with 's', 'n', 'N'
+        app.handle_event(AppEvent::LogLine {
+            generation: 1,
+            line: "ERROR second match".into(),
+        });
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.modal, Modal::LogsViewer { search_active: true, .. }));
+        for ch in "match".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Modal::LogsViewer {
+                search_active: false,
+                search_match: Some(2),
+                follow: false,
+                ..
+            }
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(matches!(app.modal, Modal::LogsViewer { search_match: Some(2), .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('N')));
+        assert!(matches!(app.modal, Modal::LogsViewer { search_match: Some(2), .. }));
+
+        // First Esc clears search_text; second Esc closes LogsViewer.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::LogsViewer { ref search_text, .. } if search_text.is_empty()));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[tokio::test]
+    async fn logs_viewer_multi_container_restarts_and_selects() {
+        let mut app = test_app();
+        app.log_gen = 1;
+        app.modal = Modal::LogsViewer {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            container: None,
+            containers: vec![],
+            lines: vec![],
+            fullscreen: false,
+            scroll: 0,
+            follow: true,
+            timestamps: false,
+            wrap: false,
+            filter_active: false,
+            filter_text: String::new(),
+            search_active: false,
+            search_text: String::new(),
+            search_match: None,
+            container_picker: None,
+            generation: 1,
+            error: Some("a container name must be specified".into()),
+        };
+
+        // ContainersLoaded picks first container, clears BadRequest error, and restarts stream.
+        app.handle_event(AppEvent::ContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            containers: vec!["haproxy-ingress".into(), "access-logs".into()],
+        });
+        assert!(matches!(
+            app.modal,
+            Modal::LogsViewer {
+                container: Some(ref c),
+                error: None,
+                generation: 2,
+                ..
+            } if c == "haproxy-ingress"
+        ));
+
+        // Pressing 'c' opens container picker; 'j' + Enter switches to 'access-logs'.
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(app.modal, Modal::LogsViewer { container_picker: Some(0), .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Modal::LogsViewer {
+                container: Some(ref c),
+                container_picker: None,
+                generation: 3,
+                ..
+            } if c == "access-logs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn container_picker_before_entering_logs_and_shell() {
+        let mut app = test_app();
+        app.screen = Screen::Resources;
+        app.focus = Focus::Main;
+        app.selected_contexts = vec!["ctx".into()];
+        let mut map = HashMap::new();
+        map.insert("1".into(), sample_row("1", "ingress-pod", "default", Health::Ok, vec![]));
+        app.rows_by_ctx.insert("ctx".into(), map);
+
+        // Pressing 'l' opens ContainerPicker first; multi-container stays in picker until user chooses.
+        app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert!(matches!(
+            app.modal,
+            Modal::ContainerPicker {
+                purpose: ContainerPurpose::Logs,
+                loading: true,
+                ..
+            }
+        ));
+        app.handle_event(AppEvent::ContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            containers: vec!["haproxy-ingress".into(), "access-logs".into()],
+        });
+        assert!(matches!(
+            app.modal,
+            Modal::ContainerPicker {
+                purpose: ContainerPurpose::Logs,
+                loading: false,
+                ..
+            }
+        ));
+        // Choosing '2' enters LogsViewer on 'access-logs', and 'c' can switch afterwards.
+        app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+        assert!(matches!(
+            app.modal,
+            Modal::LogsViewer {
+                container: Some(ref c),
+                ref containers,
+                ..
+            } if c == "access-logs" && containers.len() == 2
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(app.modal, Modal::LogsViewer { container_picker: Some(1), .. }));
+
+        // Pressing 's' on a multi-container pod opens ContainerPicker before launching Shell.
+        app.modal = Modal::None;
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(
+            app.modal,
+            Modal::ContainerPicker {
+                purpose: ContainerPurpose::Shell,
+                loading: true,
+                ..
+            }
+        ));
+        app.handle_event(AppEvent::ContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            containers: vec!["haproxy-ingress".into(), "access-logs".into()],
+        });
+        assert!(app.pending_external.is_none());
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.pending_external,
+            Some(PendingExternal::Shell {
+                container: Some(ref c),
+                ..
+            }) if c == "access-logs"
+        ));
+
+        // Single-container pod skips the picker and launches Shell directly.
+        app.pending_external = None;
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        app.handle_event(AppEvent::ContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            containers: vec!["only-one".into()],
+        });
+        assert!(matches!(app.modal, Modal::None));
+        assert!(matches!(
+            app.pending_external,
+            Some(PendingExternal::Shell {
+                container: Some(ref c),
+                ..
+            }) if c == "only-one"
+        ));
+    }
+
+    #[tokio::test]
+    async fn describe_viewer_opens_via_v_and_palette() {
+        let mut app = test_app();
+        app.screen = Screen::Resources;
+        app.focus = Focus::Main;
+        app.selected_contexts = vec!["ctx".into()];
+        let mut map = HashMap::new();
+        map.insert("1".into(), sample_row("1", "web-0", "default", Health::Ok, vec![]));
+        app.rows_by_ctx.insert("ctx".into(), map);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(
+            app.modal,
+            Modal::DescribeViewer {
+                ref name,
+                loading: true,
+                ..
+            } if name == "web-0"
+        ));
+
+        app.handle_event(AppEvent::DescribeLoaded {
+            context: "ctx".into(),
+            name: "web-0".into(),
+            namespace: Some("default".into()),
+            kind: app.active_kind.clone(),
+            result: Ok("Name: web-0\nNamespace: default\n".into()),
+        });
+        assert!(matches!(
+            app.modal,
+            Modal::DescribeViewer {
+                loading: false,
+                ref lines,
+                ..
+            } if lines == &["Name: web-0", "Namespace: default"]
+        ));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert!(matches!(app.modal, Modal::DescribeViewer { fullscreen: true, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+
+        // Command palette ':describe' also opens DescribeViewer.
+        assert!(app
+            .palette_items("describe")
+            .iter()
+            .any(|p| matches!(p, PaletteItem::Describe)));
+    }
+
+    #[tokio::test]
+    async fn containers_view_opens_and_launches_logs_and_shell() {
+        let mut app = test_app();
+        app.screen = Screen::Resources;
+        app.focus = Focus::Main;
+        app.selected_contexts = vec!["ctx".into()];
+        let mut map = HashMap::new();
+        map.insert("1".into(), sample_row("1", "ingress-pod", "default", Health::Ok, vec![]));
+        app.rows_by_ctx.insert("ctx".into(), map);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(
+            app.modal,
+            Modal::ContainersView {
+                ref pod,
+                loading: true,
+                ..
+            } if pod == "ingress-pod"
+        ));
+
+        app.handle_event(AppEvent::PodContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            result: Ok(vec![
+                k8s::PodContainerInfo {
+                    name: "haproxy-ingress".into(),
+                    kind: "container".into(),
+                    image: "haproxy:latest".into(),
+                    state: "Running".into(),
+                    ready: true,
+                    restarts: 0,
+                    ports: "80/TCP".into(),
+                },
+                k8s::PodContainerInfo {
+                    name: "access-logs".into(),
+                    kind: "container".into(),
+                    image: "busybox".into(),
+                    state: "Running".into(),
+                    ready: true,
+                    restarts: 0,
+                    ports: "".into(),
+                },
+            ]),
+        });
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(
+            app.modal,
+            Modal::DebugPrompt {
+                selected_target: 2,
+                ..
+            }
+        ));
+
+        app.modal = Modal::None;
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        app.handle_event(AppEvent::PodContainersLoaded {
+            context: "ctx".into(),
+            namespace: "default".into(),
+            pod: "ingress-pod".into(),
+            result: Ok(vec![
+                k8s::PodContainerInfo {
+                    name: "haproxy-ingress".into(),
+                    kind: "container".into(),
+                    image: "haproxy:latest".into(),
+                    state: "Running".into(),
+                    ready: true,
+                    restarts: 0,
+                    ports: "80/TCP".into(),
+                },
+                k8s::PodContainerInfo {
+                    name: "access-logs".into(),
+                    kind: "container".into(),
+                    image: "busybox".into(),
+                    state: "Running".into(),
+                    ready: true,
+                    restarts: 0,
+                    ports: "".into(),
+                },
+            ]),
+        });
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(matches!(
+            app.pending_external,
+            Some(PendingExternal::Shell {
+                container: Some(ref c),
+                ..
+            }) if c == "access-logs"
         ));
     }
 }

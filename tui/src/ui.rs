@@ -8,8 +8,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, ConfirmKind, Focus, Modal, OverviewPane, Screen, UtilizationPane, UtilizationSort,
-    YamlViewMode,
+    App, ConfirmKind, ContainerPurpose, Focus, Modal, OverviewPane, Screen, UtilizationPane,
+    UtilizationSort, YamlViewMode,
 };
 use crate::core::health::Severity;
 use crate::core::rows::{self, Health};
@@ -536,7 +536,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let keys = match app.screen {
         Screen::Overview => "0 Overview  1-9 Cluster  J/K Move  e Env  u Usage  Tab Sidebar  o Pane  Enter Open  Space Multi  s Scan  : Palette  ? Help  q Quit",
-        Screen::Resources => ":/Ctrl+K Palette  / Filter  u Usage  A Age-sort  n Namespace  [/] Kind  Enter/y YAML  x/i Decode  l Logs  s Shell  D Debug  F Forward  d Delete  ? Help  q Quit",
+        Screen::Resources => ":/Ctrl+K Palette  / Filter  u Usage  A Age-sort  n Namespace  [/] Kind  Enter/y YAML  d Describe  c Containers  l Logs  s Shell  X Debug  F Forward  D/Del Delete  ? Help  q Quit",
         Screen::Utilization => "/ Filter  o Switch Pane  c Sort CPU  m Sort Memory  r Refresh  j/k Scroll  Enter Open Pod  0/Esc Overview  ? Help  q Quit",
     };
 
@@ -569,18 +569,20 @@ fn render_modal(f: &mut Frame, app: &App) {
                 Line::from("  A (Shift+A)  Sort by Age (newest first / oldest first / name)"),
                 Line::from("  j / k / ↑ /↓ Navigate rows (g/G top/bottom, PgUp/PgDn)"),
                 Line::from("  Enter / y    View YAML"),
+                Line::from("  d            Describe selected resource (kubectl describe)"),
                 Line::from("  x / i        Decode Secret data / Interpret certs, JSON, JWT"),
                 Line::from("  c (in YAML)  Copy displayed YAML/decoded/interpreted content"),
                 Line::from("  z (in YAML/Logs) Toggle borderless fullscreen view for clean selection"),
                 Line::from("  E            Edit YAML in $EDITOR and apply"),
-                Line::from("  l            Pod Logs (f: follow, t: timestamps, c: container)"),
+                Line::from("  l            Pod Logs (/: filter, s/Ctrl+F: search, n/N: next/prev, f: follow, t: ts, w: wrap, c: container)"),
+                Line::from("  c / C (Pod)  Pod Containers view (l: logs, s: shell, d/X: debug)"),
                 Line::from("  s            Pod Shell (kubectl exec -it) / Overview: full scan"),
-                Line::from("  D (Shift+D)  Debug container (kubectl debug on Pod or Node)"),
+                Line::from("  X (Shift+X)  Debug container (kubectl debug on Pod or Node)"),
                 Line::from("  F (Shift+F)  Port-forward (Pod or Service)"),
                 Line::from("  r            Rollout Restart (Deployment/StatefulSet/DaemonSet)"),
                 Line::from("  S            Scale replicas (Deployment/StatefulSet/ReplicaSet)"),
                 Line::from("  c / p        Node Cordon/Uncordon  |  CronJob Suspend/Resume"),
-                Line::from("  d / Del      Delete resource (PROD requires typing name)"),
+                Line::from("  D / Del      Delete resource (PROD requires typing name)"),
                 Line::from("  R            Reload kubeconfig"),
                 Line::from("  Ctrl+Z       Suspend TUI (fg to resume)"),
                 Line::from("  q / Ctrl+C   Quit"),
@@ -662,6 +664,84 @@ fn render_modal(f: &mut Frame, app: &App) {
             let list = List::new(items)
                 .highlight_style(Style::default().bg(Color::Rgb(30, 41, 59)).fg(ACCENT).add_modifier(Modifier::BOLD));
             f.render_stateful_widget(list, chunks[1], &mut state);
+        }
+        Modal::DescribeViewer {
+            context,
+            kind,
+            name,
+            lines,
+            fullscreen,
+            scroll,
+            loading,
+            error,
+            ..
+        } => {
+            let title = format!(
+                " Describe: {context} / {} / {name} (j/k scroll, c copy, z full, Esc close) ",
+                kind.kind
+            );
+            if *fullscreen {
+                let area = f.area();
+                f.render_widget(Clear, area);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(area);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        title,
+                        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))),
+                    chunks[0],
+                );
+                if *loading {
+                    f.render_widget(Paragraph::new("Running kubectl describe..."), chunks[1]);
+                } else if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .wrap(Wrap { trim: false }),
+                        chunks[1],
+                    );
+                } else {
+                    let inner_h = chunks[1].height as usize;
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(*scroll)
+                        .take(inner_h)
+                        .map(|l| color_describe_line(l))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible), chunks[1]);
+                }
+            } else {
+                let area = centered_rect(88, 86, f.area());
+                f.render_widget(Clear, area);
+                let block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT));
+
+                if *loading {
+                    f.render_widget(Paragraph::new("Running kubectl describe...").block(block), area);
+                } else if let Some(err) = error {
+                    f.render_widget(
+                        Paragraph::new(err.as_str())
+                            .style(Style::default().fg(Color::Red))
+                            .block(block)
+                            .wrap(Wrap { trim: false }),
+                        area,
+                    );
+                } else {
+                    let inner_h = area.height.saturating_sub(2) as usize;
+                    let visible: Vec<Line> = lines
+                        .iter()
+                        .skip(*scroll)
+                        .take(inner_h)
+                        .map(|l| color_describe_line(l))
+                        .collect();
+                    f.render_widget(Paragraph::new(visible).block(block), area);
+                }
+            }
         }
         Modal::YamlViewer {
             context,
@@ -752,27 +832,80 @@ fn render_modal(f: &mut Frame, app: &App) {
             context,
             pod,
             container,
+            containers,
             lines,
             fullscreen,
             scroll,
             follow,
             timestamps,
+            wrap,
+            filter_active,
+            filter_text,
+            search_active,
+            search_text,
+            search_match,
+            container_picker,
             error,
             ..
         } => {
             let c_name = container.as_deref().unwrap_or("default");
+            let c_label = if containers.len() > 1 {
+                let idx = container
+                    .as_ref()
+                    .and_then(|c| containers.iter().position(|x| x == c))
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                format!("{c_name} {idx}/{}", containers.len())
+            } else {
+                c_name.to_string()
+            };
             let title = format!(
-                " Logs: {context} / {pod} [{c_name}] (follow:{} ts:{} | f:follow t:ts c:container z:full Esc:close) ",
+                " Logs: {context} / {pod} [{c_label}] (follow:{} ts:{} wrap:{} | /:filter s:search f:follow t:ts w:wrap c:container z:full Esc:close) ",
                 if *follow { "ON" } else { "OFF" },
-                if *timestamps { "ON" } else { "OFF" }
+                if *timestamps { "ON" } else { "OFF" },
+                if *wrap { "ON" } else { "OFF" }
             );
+            let show_filter = *filter_active || !filter_text.is_empty();
+            let show_search = *search_active || !search_text.is_empty();
+            let show_bar = show_filter || show_search;
+            let bar_spans = || -> Vec<Span<'_>> {
+                let mut spans = Vec::new();
+                if show_filter {
+                    spans.push(Span::styled(" /", Style::default().fg(DIM)));
+                    spans.push(Span::styled(filter_text.as_str(), Style::default().fg(Color::Green)));
+                    if *filter_active {
+                        spans.push(Span::styled("▌", Style::default().fg(Color::Green)));
+                    }
+                }
+                if show_filter && show_search {
+                    spans.push(Span::styled("  │ ", Style::default().fg(DIM)));
+                }
+                if show_search {
+                    spans.push(Span::styled(" Search: ", Style::default().fg(DIM)));
+                    spans.push(Span::styled(search_text.as_str(), Style::default().fg(Color::Cyan)));
+                    if *search_active {
+                        spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
+                    } else {
+                        spans.push(Span::styled(" (n/N)", Style::default().fg(DIM)));
+                    }
+                }
+                spans.push(Span::raw(" "));
+                spans
+            };
             if *fullscreen {
                 let area = f.area();
                 f.render_widget(Clear, area);
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(1)])
-                    .split(area);
+                let chunks = if show_bar {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+                        .split(area)
+                } else {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Min(1)])
+                        .split(area)
+                };
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         title,
@@ -780,35 +913,32 @@ fn render_modal(f: &mut Frame, app: &App) {
                     ))),
                     chunks[0],
                 );
+                let body_area = if show_bar {
+                    f.render_widget(Paragraph::new(Line::from(bar_spans())), chunks[1]);
+                    chunks[2]
+                } else {
+                    chunks[1]
+                };
                 if let Some(err) = error {
                     f.render_widget(
                         Paragraph::new(err.as_str())
                             .style(Style::default().fg(Color::Red))
                             .wrap(Wrap { trim: false }),
-                        chunks[1],
+                        body_area,
                     );
                 } else {
-                    let inner_h = chunks[1].height as usize;
-                    let start = if *follow {
-                        lines.len().saturating_sub(inner_h)
-                    } else {
-                        (*scroll).min(lines.len().saturating_sub(1))
-                    };
-                    let visible: Vec<Line> = lines
-                        .iter()
-                        .skip(start)
-                        .take(inner_h)
-                        .map(|l| Line::from(l.as_str()))
-                        .collect();
-                    f.render_widget(Paragraph::new(visible), chunks[1]);
+                    render_logs_body(f, body_area, None, lines, *scroll, *follow, *wrap, filter_text, search_text, *search_match);
                 }
             } else {
                 let area = centered_rect(90, 86, f.area());
                 f.render_widget(Clear, area);
-                let block = Block::default()
+                let mut block = Block::default()
                     .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT));
+                if show_bar {
+                    block = block.title_bottom(Line::from(bar_spans()));
+                }
 
                 if let Some(err) = error {
                     f.render_widget(
@@ -819,20 +949,43 @@ fn render_modal(f: &mut Frame, app: &App) {
                         area,
                     );
                 } else {
-                    let inner_h = area.height.saturating_sub(2) as usize;
-                    let start = if *follow {
-                        lines.len().saturating_sub(inner_h)
-                    } else {
-                        (*scroll).min(lines.len().saturating_sub(1))
-                    };
-                    let visible: Vec<Line> = lines
-                        .iter()
-                        .skip(start)
-                        .take(inner_h)
-                        .map(|l| Line::from(l.as_str()))
-                        .collect();
-                    f.render_widget(Paragraph::new(visible).block(block), area);
+                    render_logs_body(f, area, Some(block), lines, *scroll, *follow, *wrap, filter_text, search_text, *search_match);
                 }
+            }
+            if let Some(sel) = container_picker {
+                let height = (containers.len() as u16 + 2).min(f.area().height.saturating_sub(4)).max(4);
+                let width = 48u16.min(f.area().width.saturating_sub(4)).max(20);
+                let popup = Rect {
+                    x: f.area().x + f.area().width.saturating_sub(width) / 2,
+                    y: f.area().y + f.area().height.saturating_sub(height) / 2,
+                    width,
+                    height,
+                };
+                f.render_widget(Clear, popup);
+                let items: Vec<ListItem> = containers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let active = container.as_deref() == Some(c.as_str());
+                        let num = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+                        let suffix = if active { " (active)" } else { "" };
+                        let style = if i == *sel {
+                            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+                        } else if active {
+                            Style::default().fg(ACCENT)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(Line::from(Span::styled(format!(" {num}{c}{suffix}"), style)))
+                    })
+                    .collect();
+                let list = List::new(items).block(
+                    Block::default()
+                        .title(" Select Container (↑/↓, 1-9, Enter, Esc) ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT)),
+                );
+                f.render_widget(list, popup);
             }
         }
         Modal::Confirm { kind, typed } => {
@@ -953,6 +1106,143 @@ fn render_modal(f: &mut Frame, app: &App) {
                 .block(Block::default().title(" Scale ").borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
             f.render_widget(p, area);
         }
+        Modal::ContainerPicker {
+            pod,
+            purpose,
+            containers,
+            selected,
+            loading,
+            ..
+        } => {
+            let what = match purpose {
+                ContainerPurpose::Logs => "Logs",
+                ContainerPurpose::Shell => "Shell",
+            };
+            let height = if *loading {
+                5
+            } else {
+                (containers.len() as u16 + 2).min(f.area().height.saturating_sub(4)).max(5)
+            };
+            let width = 56u16.min(f.area().width.saturating_sub(4)).max(24);
+            let area = Rect {
+                x: f.area().x + f.area().width.saturating_sub(width) / 2,
+                y: f.area().y + f.area().height.saturating_sub(height) / 2,
+                width,
+                height,
+            };
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .title(format!(" Select Container for {what}: {pod} (↑/↓, 1-9, Enter, Esc) "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            if *loading {
+                f.render_widget(Paragraph::new(" Loading containers...").block(block), area);
+            } else {
+                let items: Vec<ListItem> = containers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let num = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+                        let style = if i == *selected {
+                            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(Line::from(Span::styled(format!(" {num}{c}"), style)))
+                    })
+                    .collect();
+                f.render_widget(List::new(items).block(block), area);
+            }
+        }
+        Modal::ContainersView {
+            context,
+            pod,
+            containers,
+            selected,
+            loading,
+            error,
+            ..
+        } => {
+            let area = centered_rect(90, 72, f.area());
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .title(format!(
+                    " Containers: {context} / {pod} (↑/↓ select, l/Enter logs, s shell, d/X debug, r refresh, Esc close) "
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            if *loading {
+                f.render_widget(Paragraph::new(" Loading containers...").block(block), area);
+            } else if let Some(err) = error {
+                f.render_widget(
+                    Paragraph::new(err.as_str())
+                        .style(Style::default().fg(Color::Red))
+                        .block(block)
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            } else {
+                let header = TuiRow::new(vec![
+                    Cell::from("NAME"),
+                    Cell::from("TYPE"),
+                    Cell::from("STATE"),
+                    Cell::from("READY"),
+                    Cell::from("RESTARTS"),
+                    Cell::from("PORTS"),
+                    Cell::from("IMAGE"),
+                ])
+                .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
+                let rows: Vec<TuiRow> = containers
+                    .iter()
+                    .map(|c| {
+                        let st_color = if c.state == "Running" {
+                            Color::Green
+                        } else if c.state.contains("CrashLoop")
+                            || c.state.contains("Error")
+                            || c.state.contains("Err")
+                            || c.state.contains("Failed")
+                        {
+                            Color::Red
+                        } else if c.state.starts_with("Waiting") {
+                            Color::Yellow
+                        } else {
+                            DIM
+                        };
+                        TuiRow::new(vec![
+                            Cell::from(c.name.as_str()),
+                            Cell::from(c.kind.as_str()).style(Style::default().fg(DIM)),
+                            Cell::from(c.state.as_str()).style(Style::default().fg(st_color)),
+                            Cell::from(if c.ready { "true" } else { "false" }),
+                            Cell::from(c.restarts.to_string()),
+                            Cell::from(c.ports.as_str()),
+                            Cell::from(c.image.as_str()),
+                        ])
+                    })
+                    .collect();
+                let widths = [
+                    Constraint::Percentage(18),
+                    Constraint::Length(10),
+                    Constraint::Percentage(20),
+                    Constraint::Length(6),
+                    Constraint::Length(9),
+                    Constraint::Percentage(14),
+                    Constraint::Percentage(26),
+                ];
+                let table = Table::new(rows, widths)
+                    .header(header)
+                    .block(block)
+                    .row_highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                let mut state = TableState::default();
+                if !containers.is_empty() {
+                    state.select(Some((*selected).min(containers.len() - 1)));
+                }
+                f.render_stateful_widget(table, area, &mut state);
+            }
+        }
         Modal::EnvPicker { context, selected } => {
             let area = centered_rect(54, 38, f.area());
             f.render_widget(Clear, area);
@@ -1015,11 +1305,12 @@ fn render_modal(f: &mut Frame, app: &App) {
             is_node,
             selected_preset,
             custom_image,
-            target,
-            editing_target,
+            containers,
+            selected_target,
+            focus_target,
             ..
         } => {
-            let area = centered_rect(58, if *is_node { 36 } else { 42 }, f.area());
+            let area = centered_rect(58, if *is_node { 36 } else { 50 }, f.area());
             f.render_widget(Clear, area);
             let kind_label = if *is_node { "Node" } else { "Pod" };
             let block = Block::default()
@@ -1031,7 +1322,7 @@ fn render_modal(f: &mut Frame, app: &App) {
 
             let mut constraints = vec![Constraint::Min(1)];
             if !*is_node {
-                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Length(5));
             }
             constraints.push(Constraint::Length(2));
             let chunks = Layout::default()
@@ -1043,7 +1334,7 @@ fn render_modal(f: &mut Frame, app: &App) {
                 .iter()
                 .map(|img| ListItem::new(*img))
                 .collect();
-            let custom_label = if *selected_preset == crate::app::DEBUG_IMAGES.len() && !*editing_target {
+            let custom_label = if *selected_preset == crate::app::DEBUG_IMAGES.len() && !*focus_target {
                 format!("Custom: {custom_image}▌")
             } else if custom_image.is_empty() {
                 "Custom image…".to_string()
@@ -1057,26 +1348,29 @@ fn render_modal(f: &mut Frame, app: &App) {
             let list = List::new(items).highlight_style(
                 Style::default()
                     .bg(Color::Rgb(30, 41, 59))
-                    .fg(if *editing_target { Color::Gray } else { ACCENT })
+                    .fg(if *focus_target { Color::Gray } else { ACCENT })
                     .add_modifier(Modifier::BOLD),
             );
             f.render_stateful_widget(list, chunks[0], &mut state);
 
             let hint_idx = if !*is_node {
-                let tgt_style = if *editing_target {
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                let cursor = if *editing_target { "▌" } else { "" };
-                let tgt_line = Line::from(vec![
-                    Span::styled("Target container (optional): ", Style::default().fg(DIM)),
-                    Span::styled(format!("{target}{cursor}"), tgt_style),
-                ]);
-                f.render_widget(
-                    Paragraph::new(tgt_line).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(DIM))),
-                    chunks[1],
+                let mut tgt_items = vec![ListItem::new("(none — no --target)")];
+                for c in containers {
+                    tgt_items.push(ListItem::new(c.as_str()));
+                }
+                let mut tgt_state = ListState::default();
+                tgt_state.select(Some((*selected_target).min(tgt_items.len().saturating_sub(1))));
+                let tgt_block = Block::default()
+                    .title(" Target container ")
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(if *focus_target { ACCENT } else { DIM }));
+                let tgt_list = List::new(tgt_items).block(tgt_block).highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(30, 41, 59))
+                        .fg(if *focus_target { ACCENT } else { Color::Gray })
+                        .add_modifier(Modifier::BOLD),
                 );
+                f.render_stateful_widget(tgt_list, chunks[1], &mut tgt_state);
                 2
             } else {
                 1
@@ -1557,6 +1851,175 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_logs_body(
+    f: &mut Frame,
+    area: Rect,
+    block: Option<Block>,
+    lines: &[String],
+    scroll: usize,
+    follow: bool,
+    wrap: bool,
+    filter_text: &str,
+    search_text: &str,
+    search_match: Option<usize>,
+) {
+    let inner_h = if block.is_some() { area.height.saturating_sub(2) } else { area.height } as usize;
+    let inner_w = if block.is_some() { area.width.saturating_sub(2) } else { area.width };
+    if inner_h == 0 || inner_w == 0 {
+        if let Some(b) = block {
+            f.render_widget(b, area);
+        }
+        return;
+    }
+
+    let fq = filter_text.trim().to_lowercase();
+    let sq = search_text.trim().to_lowercase();
+    let matched: Vec<&str> = if fq.is_empty() {
+        lines.iter().map(|s| s.as_str()).collect()
+    } else {
+        lines
+            .iter()
+            .filter(|l| l.to_lowercase().contains(&fq))
+            .map(|s| s.as_str())
+            .collect()
+    };
+
+    let render_line = |idx: usize, l: &str| -> Line<'static> {
+        let is_current = search_match == Some(idx);
+        if !sq.is_empty() {
+            let bg = if is_current { Color::LightCyan } else { Color::Cyan };
+            highlight_log_match(l, &sq, bg)
+        } else if !fq.is_empty() {
+            highlight_log_match(l, &fq, Color::Yellow)
+        } else {
+            Line::from(l.to_string())
+        }
+    };
+
+    let mut p = if wrap {
+        if follow {
+            let mut total_rows = 0usize;
+            let mut start = matched.len();
+            for (idx, l) in matched.iter().enumerate().rev() {
+                let rows = wrapped_line_rows(l, inner_w as usize);
+                total_rows += rows;
+                start = idx;
+                if total_rows >= inner_h {
+                    break;
+                }
+            }
+            let skip_rows = total_rows.saturating_sub(inner_h) as u16;
+            let visible: Vec<Line> = matched[start..]
+                .iter()
+                .enumerate()
+                .map(|(offset, l)| render_line(start + offset, l))
+                .collect();
+            Paragraph::new(visible).wrap(Wrap { trim: false }).scroll((skip_rows, 0))
+        } else {
+            let start = scroll.min(matched.len().saturating_sub(1));
+            let visible: Vec<Line> = matched
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(inner_h)
+                .map(|(idx, l)| render_line(idx, l))
+                .collect();
+            Paragraph::new(visible).wrap(Wrap { trim: false })
+        }
+    } else {
+        let start = if follow {
+            matched.len().saturating_sub(inner_h)
+        } else {
+            scroll.min(matched.len().saturating_sub(1))
+        };
+        let visible: Vec<Line> = matched
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(inner_h)
+            .map(|(idx, l)| render_line(idx, l))
+            .collect();
+        Paragraph::new(visible)
+    };
+
+    if let Some(b) = block {
+        p = p.block(b);
+    }
+    f.render_widget(p, area);
+}
+
+fn highlight_log_match(line: &str, query_lower: &str, bg: Color) -> Line<'static> {
+    let lower = line.to_lowercase();
+    if lower.len() != line.len() {
+        return Line::from(line.to_string());
+    }
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find(query_lower) {
+        let start = pos + rel;
+        let end = start + query_lower.len();
+        if start > pos {
+            spans.push(Span::raw(line[pos..start].to_string()));
+        }
+        spans.push(Span::styled(
+            line[start..end].to_string(),
+            Style::default().fg(Color::Black).bg(bg),
+        ));
+        pos = end;
+    }
+    if pos < line.len() {
+        spans.push(Span::raw(line[pos..].to_string()));
+    }
+    Line::from(spans)
+}
+
+fn wrapped_line_rows(s: &str, width: usize) -> usize {
+    if width == 0 || s.is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in s.split_inclusive(' ') {
+        let w = Line::from(word).width();
+        if col + w <= width {
+            col += w;
+        } else if w <= width {
+            rows += 1;
+            col = w;
+        } else {
+            let mut buf = [0u8; 4];
+            for ch in word.chars() {
+                let cw = Line::from(ch.encode_utf8(&mut buf) as &str).width();
+                if col + cw > width && col > 0 {
+                    rows += 1;
+                    col = 0;
+                }
+                col += cw;
+            }
+        }
+    }
+    rows
+}
+
+fn color_describe_line(line: &str) -> Line<'static> {
+    if line.contains("Warning") {
+        return Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Yellow)));
+    }
+    if line.contains("Failed") || line.contains("Error") || line.contains("BackOff") {
+        return Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Red)));
+    }
+    if let Some((key, rest)) = line.split_once(':') {
+        if !key.trim().is_empty() && !key.starts_with(' ') {
+            return Line::from(vec![
+                Span::styled(format!("{key}:"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::raw(rest.to_string()),
+            ]);
+        }
+    }
+    Line::from(line.to_string())
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

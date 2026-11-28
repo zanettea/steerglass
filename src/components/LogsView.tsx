@@ -5,6 +5,7 @@ import { api, errText, type ObjRef } from "../api";
 import { useStore } from "../store";
 import { hasAnsi, parseAnsi, stripAnsi, type Span } from "../ansi";
 import { aiBlocked, summarizeLogs, useAi } from "../ai";
+import { typingIn } from "../util";
 
 const MAX_LINES = 50_000;
 /** Lines dropped at once when the buffer is full, so trimming isn't an O(n) shift on every batch. */
@@ -84,6 +85,19 @@ export function LogsView({ objRef, initialContainer }: { objRef: ObjRef; initial
     };
   }, [objRef, container, previous, timestamps]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const st = useStore.getState();
+      if (st.paletteOpen || st.confirm || st.helpOpen || st.settingsOpen || st.applyOpen || st.aboutOpen) return;
+      if ((e.key === "w" || e.key === "W") && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
+        e.preventDefault();
+        setWrap((w) => !w);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const q = query.toLowerCase();
   const all = lines.current;
   // `tick` changes on every batch (the buffer is mutated in place, so its identity never changes).
@@ -147,7 +161,7 @@ export function LogsView({ objRef, initialContainer }: { objRef: ObjRef; initial
         <label>
           <input type="checkbox" checked={previous} onChange={(e) => setPrevious(e.target.checked)} /> Previous
         </label>
-        <label>
+        <label title="Toggle word wrap (W)">
           <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> Wrap
         </label>
         <div className="spacer" />

@@ -60,6 +60,7 @@ const SECTIONS: { title: string; rows: Row[] }[] = [
     title: "Editors and logs",
     rows: [
       [[`${modKey}S`], "Save YAML / apply manifest"],
+      [["W"], "Toggle word wrap in logs"],
       [["scroll up"], "Pause log follow; the ↓ button resumes it"],
     ],
   },

@@ -94,6 +94,17 @@ pub enum WatchUpdate {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct PodContainerInfo {
+    pub name: String,
+    pub kind: String,
+    pub image: String,
+    pub state: String,
+    pub ready: bool,
+    pub restarts: i32,
+    pub ports: String,
+}
+
 pub enum AppEvent {
     SummaryLoaded {
         context: String,
@@ -134,11 +145,24 @@ pub enum AppEvent {
         kind: KindRef,
         result: std::result::Result<String, String>,
     },
+    DescribeLoaded {
+        context: String,
+        name: String,
+        namespace: Option<String>,
+        kind: KindRef,
+        result: std::result::Result<String, String>,
+    },
     ContainersLoaded {
         context: String,
         namespace: String,
         pod: String,
         containers: Vec<String>,
+    },
+    PodContainersLoaded {
+        context: String,
+        namespace: String,
+        pod: String,
+        result: std::result::Result<Vec<PodContainerInfo>, String>,
     },
     LogLine {
         generation: u64,
@@ -538,6 +562,207 @@ pub fn spawn_yaml(
             name,
             namespace,
             kind,
+            result: res,
+        });
+    });
+}
+
+struct DescribeTempKubeconfig(Option<std::path::PathBuf>);
+
+impl Drop for DescribeTempKubeconfig {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub fn spawn_describe(
+    state: Arc<AppState>,
+    context: String,
+    kind: KindRef,
+    namespace: Option<String>,
+    name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let res = async {
+            let mut cmd = tokio::process::Command::new("kubectl");
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp = std::env::temp_dir().join(format!(
+                "steerglass-describe-{}-{nanos}.yaml",
+                std::process::id()
+            ));
+            let yaml = {
+                let kc = state.kubeconfig.read();
+                serde_yaml::to_string(&*kc).map_err(|e| e.to_string())?
+            };
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .map_err(|e| e.to_string())?;
+                f.write_all(yaml.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp, yaml).map_err(|e| e.to_string())?;
+            }
+            let _guard = DescribeTempKubeconfig(Some(tmp.clone()));
+            let resource = if kind.group.is_empty() {
+                kind.plural.clone()
+            } else {
+                format!("{}.{}", kind.plural, kind.group)
+            };
+            cmd.arg("--kubeconfig")
+                .arg(&tmp)
+                .arg("--context")
+                .arg(&context)
+                .arg("describe")
+                .arg(&resource)
+                .arg(&name);
+            if let Some(ns) = &namespace {
+                cmd.arg("-n").arg(ns);
+            }
+            let out = cmd
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run kubectl describe: {e}"))?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if err.is_empty() {
+                    Err(format!("kubectl describe exited with {}", out.status))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+        .await;
+        let _ = tx.send(AppEvent::DescribeLoaded {
+            context,
+            name,
+            namespace,
+            kind,
+            result: res,
+        });
+    });
+}
+
+pub fn spawn_pod_containers(
+    state: Arc<AppState>,
+    context: String,
+    namespace: String,
+    pod_name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let res = async {
+            let client = state.client(&context).await?;
+            let api: Api<Pod> = Api::namespaced(client, &namespace);
+            let pod = api.get(&pod_name).await?;
+            let mut out = Vec::new();
+            let status = pod.status.as_ref();
+            let format_state = |cs: Option<&k8s_openapi::api::core::v1::ContainerStatus>| -> (String, bool, i32) {
+                let Some(cs) = cs else {
+                    return ("Unknown".into(), false, 0);
+                };
+                let state_str = if let Some(st) = &cs.state {
+                    if st.running.is_some() {
+                        "Running".into()
+                    } else if let Some(w) = &st.waiting {
+                        match &w.reason {
+                            Some(r) if !r.is_empty() => format!("Waiting ({r})"),
+                            _ => "Waiting".into(),
+                        }
+                    } else if let Some(t) = &st.terminated {
+                        match &t.reason {
+                            Some(r) if !r.is_empty() => format!("Terminated ({r}, exit {})", t.exit_code),
+                            _ => format!("Terminated (exit {})", t.exit_code),
+                        }
+                    } else {
+                        "Unknown".into()
+                    }
+                } else {
+                    "Unknown".into()
+                };
+                (state_str, cs.ready, cs.restart_count)
+            };
+            let format_ports = |ports: Option<&Vec<k8s_openapi::api::core::v1::ContainerPort>>| -> String {
+                ports
+                    .map(|ps| {
+                        ps.iter()
+                            .map(|p| {
+                                let proto = p.protocol.as_deref().unwrap_or("TCP");
+                                format!("{}/{proto}", p.container_port)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            };
+            if let Some(spec) = &pod.spec {
+                let reg_statuses = status.and_then(|s| s.container_statuses.as_ref());
+                for c in &spec.containers {
+                    let cs = reg_statuses.and_then(|v| v.iter().find(|x| x.name == c.name));
+                    let (st, ready, restarts) = format_state(cs);
+                    out.push(PodContainerInfo {
+                        name: c.name.clone(),
+                        kind: "container".into(),
+                        image: c.image.clone().unwrap_or_default(),
+                        state: st,
+                        ready,
+                        restarts,
+                        ports: format_ports(c.ports.as_ref()),
+                    });
+                }
+                let init_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
+                for c in spec.init_containers.as_deref().unwrap_or_default() {
+                    let cs = init_statuses.and_then(|v| v.iter().find(|x| x.name == c.name));
+                    let (st, ready, restarts) = format_state(cs);
+                    out.push(PodContainerInfo {
+                        name: c.name.clone(),
+                        kind: "init".into(),
+                        image: c.image.clone().unwrap_or_default(),
+                        state: st,
+                        ready,
+                        restarts,
+                        ports: format_ports(c.ports.as_ref()),
+                    });
+                }
+                let eph_statuses = status.and_then(|s| s.ephemeral_container_statuses.as_ref());
+                for c in spec.ephemeral_containers.as_deref().unwrap_or_default() {
+                    let cs = eph_statuses.and_then(|v| v.iter().find(|x| x.name == c.name));
+                    let (st, ready, restarts) = format_state(cs);
+                    out.push(PodContainerInfo {
+                        name: c.name.clone(),
+                        kind: "ephemeral".into(),
+                        image: c.image.clone().unwrap_or_default(),
+                        state: st,
+                        ready,
+                        restarts,
+                        ports: format_ports(c.ports.as_ref()),
+                    });
+                }
+            }
+            Ok::<_, Error>(out)
+        }
+        .await
+        .map_err(|e| e.to_string());
+        let _ = tx.send(AppEvent::PodContainersLoaded {
+            context,
+            namespace,
+            pod: pod_name,
             result: res,
         });
     });
